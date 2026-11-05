@@ -13,8 +13,8 @@ class Importer:
         self._fixed_schedules = pd.DataFrame()
         self._time_slots = self._generate_time_slots()
 
-    def parse_from_excel(self, rooms_io: str = 'table2.xlsx', rooms_sheet_name: str = 'Аудитории', courses_io: str = 'table.xlsx',
-                         desires_io: str = 'table3.xlsx', courses_sheets=None) -> dict:
+    def parse_from_excel(self, rooms_io: str = 'tables/table2.xlsx', rooms_sheet_name: str = 'Аудитории', courses_io: str = 'tables/table.xlsx',
+                         desires_io: str = 'tables/table3.xlsx', courses_sheets=None) -> dict:
         if courses_sheets is None:
             courses_sheets = ['ХИМИКИ', 'ФИНЗ', 'ФИНЗ Магистры', 'ЭБМ', 'Тургенева 4 по выбору', 'Тургенева 4']
         self._courses = self._parse_courses(courses_io, courses_sheets)
@@ -120,7 +120,6 @@ class Importer:
 
     def _generate_fixed_schedules(self, df: pd.DataFrame) -> pd.DataFrame:
         df = df[df['name'].isin(self.fixed_courses)]
-        print(df)
         def _get_pe(course): # можно заменить на честный парсинг из таблицы, но пока так
             if course == 1:
                 return [12, 22]
