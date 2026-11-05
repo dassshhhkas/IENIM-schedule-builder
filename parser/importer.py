@@ -8,32 +8,72 @@ class Importer:
     def __init__(self):
         self._teachers = pd.DataFrame()
         self._groups = pd.DataFrame()
+        self._courses = pd.DataFrame()
         self.fixed_courses = ['Прикладная физическая культура (практика)']
         self._fixed_schedules = pd.DataFrame()
         self._time_slots = self._generate_time_slots()
 
     def parse_from_excel(self, rooms_io: str = 'table2.xlsx', rooms_sheet_name: str = 'Аудитории', courses_io: str = 'table.xlsx',
-                         courses_sheets=None) -> dict:
+                         desires_io: str = 'table3.xlsx', courses_sheets=None) -> dict:
         if courses_sheets is None:
             courses_sheets = ['ХИМИКИ', 'ФИНЗ', 'ФИНЗ Магистры', 'ЭБМ', 'Тургенева 4 по выбору', 'Тургенева 4']
+        self._courses = self._parse_courses(courses_io, courses_sheets)
+        desires = self._parse_teachers_desires(pd.read_excel(io=desires_io))
+
         return {
             "rooms": self._parse_rooms(pd.read_excel(io=rooms_io, sheet_name=rooms_sheet_name, header=[0, 2])),
-            "courses": self._parse_courses(courses_io, courses_sheets),
-            "teachers": self._teachers.to_dict(orient='records'),
+            "courses": self._courses,
+            "teachers": self._teachers.to_dict(orient='records'), # сейчас тут встречается фигня, потом надо будет парсить с таблицы с пожеланиями
             "groups": self._groups.to_dict(orient='records'),
             "fixed_schedules": self._fixed_schedules.to_dict(orient='records'),
             "time_slots": self._time_slots,
-
-
-            "teachers_impossible_slots": [
-                {"teacher_id": "Улитко М.В.", "timeslots_ids": [1, 2, 3]},
-                {"teacher_id": "Хацко С.Л.", "timeslots_ids": [4, 5, 6]},
-            ],
-            "teachers_unwanted_slots": [
-                {"teacher_id": "Улитко М.В.", "timeslots_ids": [10]},
-                {"teacher_id": "Хацко С.Л.", "timeslots_ids": [1]},
-            ],
+            "teachers_impossible_slots": desires[0],
+            "teachers_wanted_slots": desires[1],
         }
+
+    def _parse_teachers_desires(self, df: pd.DataFrame) -> tuple:
+
+        slot_mapping = {
+            (slot['day'].lower(), slot['slot_index']): slot['id']
+            for slot in self._time_slots
+        }
+
+        cannot_cols = [c for c in df.columns if 'Не могу' in c or 'Не могу' in c]
+        want_cols = [c for c in df.columns if 'Хочу' in c]
+        auditory_cols = [c for c in df.columns if 'Что должно быть в аудитории' in c]
+
+        def _get_chosen_slot_ids(row, columns, prefix_to_remove):
+            chosen_ids = []
+            for col in columns:
+                if pd.notna(row[col]) and row[col] != '' and row[col] is not False:
+                    clean_name = col.replace(prefix_to_remove, '').strip()
+
+                    parts = [p.strip() for p in clean_name.split('/')]
+                    day = parts[0].replace('во ', '').replace('в ', '').strip().lower()
+                    slot_index = int(''.join(filter(str.isdigit, parts[1])))
+                    slot_id = slot_mapping.get((day, slot_index))
+                    if slot_id is not None:
+                        chosen_ids.append(slot_id)
+
+            return sorted(list(set(chosen_ids)))
+
+        df['impossible_slots'] = df.apply(lambda r: _get_chosen_slot_ids(r, cannot_cols, 'Не могу'), axis=1)
+        df['wanted_slots'] = df.apply(lambda r: _get_chosen_slot_ids(r, want_cols, 'Хочу'), axis=1)
+        df['room_requirements'] = df.apply(lambda r: [col.split(' / ')[-1] for col in auditory_cols if
+                                                           pd.notna(r[col]) and r[col] != '' and r[col] is not False],
+                                                axis=1)
+        # тут бы добавить проверку, что запрещенные и желаемые не пересекаются, пока надеемся на адекватность
+        df['course_name'] = df['Какую дисциплину вы ведете?'] + df['Тип дисциплины'].apply(lambda x: f' ({str(x).lower()})')
+        df['group_ids'] = df['Укажите группы, у которых вы ведете эту дисциплину'].apply(lambda x: x.split(', '))
+        df = df[['ФИО', 'course_name', 'group_ids', 'Аудитория', 'Вид аудитории', 'Вместимость', 'room_requirements', 'Другие комментарии', 'impossible_slots', 'wanted_slots']]
+        df = df.rename(columns={'ФИО': 'teacher_id', 'Аудитория': 'fixed_room', 'Вид аудитории': 'room_type', 'Вместимость': 'capacity', 'Другие комментарии': 'comments'})
+
+        impossible_slots = df[['teacher_id', 'course_name', 'group_ids', 'impossible_slots', 'comments']]
+        wanted_slots = df[['teacher_id', 'course_name', 'group_ids', 'fixed_room', 'room_type',
+       'capacity', 'room_requirements', 'wanted_slots', 'comments']]
+
+        return impossible_slots.to_dict(orient='records'), wanted_slots.to_dict(orient='records')
+
 
     @staticmethod
     def _parse_rooms(rooms: pd.DataFrame):
