@@ -16,8 +16,6 @@ class Importer:
     desires_file = data_dir / "table3.xlsx"
     course_sheets = ["ХИМИКИ", "ФИНЗ", "ФИНЗ Магистры", "ЭБМ", "Тургенева 4 по выбору", "Тургенева 4"]
     days = ["ПОНЕДЕЛЬНИК", "ВТОРНИК", "СРЕДА", "ЧЕТВЕРГ", "ПЯТНИЦА", "СУББОТА"]
-    semester_weeks = 17
-    hours_per_pair = 2
     group_size = 30
     fixed_course_names = {"Прикладная физическая культура (практика)"}
 
@@ -39,16 +37,14 @@ class Importer:
 
     def __init__(self, rooms_file: str | PathLike = rooms_file, rooms_sheet: str = rooms_sheet,
                  courses_file: str | PathLike = courses_file, course_sheets: list[str] | None = None,
-                 days: list[str] | None = None, semester_weeks: int = semester_weeks,
-                 save_path: str | PathLike | None = None, desires_file: str | PathLike | None = desires_file,
-                 fixed_course_names: set[str] | None = None):
+                 days: list[str] | None = None, save_path: str | PathLike | None = None,
+                 desires_file: str | PathLike | None = desires_file, fixed_course_names: set[str] | None = None):
         self.rooms_file = rooms_file
         self.rooms_sheet = rooms_sheet
         self.courses_file = courses_file
         self.desires_file = desires_file
         self.course_sheets = list(course_sheets) if course_sheets is not None else list(type(self).course_sheets)
         self.days = list(days) if days is not None else list(type(self).days)
-        self.semester_weeks = semester_weeks
         self.save_path = Path(save_path) if save_path is not None else Path.cwd() / "data.json"
         self.fixed_course_names = set(fixed_course_names) \
             if fixed_course_names is not None \
@@ -130,6 +126,7 @@ class Importer:
         capacity = pd.to_numeric(rooms["capacity"].astype(str).str.extract(r"(\d+)", expand=False), errors="coerce")
         rooms = rooms[capacity.notna()].copy()
         rooms["capacity"] = capacity.loc[rooms.index].astype(int)
+        rooms["has_board"] = rooms["has_chalkboard"] | rooms["has_whiteboard"] | rooms["has_multimedia_board"]
         return rooms.to_dict(orient="records")
 
     def _parse_courses(self) -> list[dict]:
@@ -168,7 +165,7 @@ class Importer:
         return {"id": f"c{self._course_count}", "name": name,
                 "teacher_id": self._parse_teacher(row.get(self.teacher_columns[lesson_type])),
                 "group_ids": group_ids,
-                "lessons_per_week": round(hours / (self.hours_per_pair * self.semester_weeks)),
+                "hours_per_semester": hours,
                 "requirements": self._parse_requirements(row, lesson_type),
                 "_course_number": row.get("Курс")}
 
