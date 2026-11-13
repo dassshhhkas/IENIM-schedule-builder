@@ -9,5 +9,6 @@ requires-python = ">=3.11"
 dependencies = [
     "numpy>=2.4.6",
     "openpyxl>=3.1.5",
+    "ortools>=9.10",
     "pandas>=3.1.1",
 ]
