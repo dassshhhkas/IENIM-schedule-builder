@@ -1,5 +1,7 @@
 import json
 import math
+import argparse
+from collections import defaultdict
 from pathlib import Path
 
 from ortools.sat.python import cp_model
@@ -14,6 +16,9 @@ DEFAULT_CONFIG = {
     "solve_strategy": "auto",
     # порог оценки |inst|×|starts|×|rooms| → two_phase в режиме auto
     "var_threshold_two_phase": 80_000,
+    # refuse model builds whose estimated monolithic domain is unsafe for MVP
+    # machines; can be raised explicitly after measuring available memory
+    "max_estimated_vars": 200_000,
     # после feasibility оставить не больше N аудиторий (0 = без лимита)
     "max_candidate_rooms": 24,
     # если two_phase phase2 не сошёлся — fallback на monolithic с остатком времени
@@ -38,11 +43,11 @@ DEFAULT_CONFIG = {
     "missing_teacher_policy": "placeholder",
     "strict": False,
     # fixed_schedules count mismatch (физкультура vs много instances): strict|warn
-    "fixed_schedule_mismatch_policy": "strict",
+    "fixed_schedule_mismatch_policy": "warn",
     # анкетный fixed_room не вмещает / нет в справочнике: strict|warn
-    "infeasible_fixed_room_policy": "strict",
+    "infeasible_fixed_room_policy": "warn",
     # нет ни одной аудитории под students/requirements: strict|warn (warn → drop instance)
-    "unplaceable_instance_policy": "strict",
+    "unplaceable_instance_policy": "warn",
     # soft-штраф за нарушение time_wishes со strength=soft
     "weight_time_wish": 8,
     # soft objective (п.14)
@@ -226,6 +231,18 @@ def _room_has_any_flag(room: dict, flags: tuple[str, ...]) -> bool:
 def room_meets_requirements(room: dict, requirements: list[str] | None) -> bool:
     """Проверить hard-требования курса к оснащению аудитории."""
     for req in requirements or []:
+        # Software and computer-class constraints are evaluated separately by
+        # room_meets_software(), which can use both explicit flags and room type.
+        if req == "software":
+            continue
+        if req == "computer_class":
+            if not room_meets_software(room, True):
+                return False
+            continue
+        if req == "internet":
+            if not any(bool(room.get(flag)) for flag in ("has_internet", "has_wifi")):
+                return False
+            continue
         flags = REQUIREMENT_FLAGS.get(req)
         if flags is None:
             # неизвестное требование: не отсекаем размещение молча —
@@ -243,7 +260,10 @@ def room_meets_software(room: dict, needs_software: object) -> bool:
     if room.get("has_computers") or room.get("is_computer_class"):
         return True
     room_type = str(room.get("type") or room.get("kind") or "").lower()
-    if room_type in {"компьютерный", "computer", "pc", "комп", "к"}:
+    if (
+        room_type in {"компьютерный", "computer", "pc", "комп", "к", "ивц"}
+        or "компьютер" in room_type
+    ):
         return True
     software = room.get("software") or room.get("available_software")
     if isinstance(needs_software, str) and software:
@@ -343,6 +363,7 @@ def restriction_matches_instance(restriction: dict, inst: dict) -> bool:
 def collect_forbidden_slots_by_instance(
     course_instances: list[dict],
     restrictions: list[dict] | None,
+    fixed_events: list[dict] | None = None,
 ) -> dict[str, set[int]]:
     """instance_id -> множество запрещённых timeslot id."""
     forbidden: dict[str, set[int]] = {inst["instance_id"]: set() for inst in course_instances}
@@ -357,6 +378,22 @@ def collect_forbidden_slots_by_instance(
         for inst in course_instances:
             if restriction_matches_instance(restriction, inst):
                 forbidden[inst["instance_id"]].update(slot_ids)
+    for event in fixed_events or []:
+        slot_ids = {
+            int(slot_id)
+            for slot_id in (event.get("timeslots_ids") or [])
+            if slot_id is not None
+        }
+        event_weeks = frozenset(int(week) for week in (event.get("weeks") or []))
+        event_groups = set(event.get("group_ids") or [])
+        if not slot_ids or not event_groups:
+            continue
+        for inst in course_instances:
+            if not event_groups.intersection(inst.get("group_ids") or []):
+                continue
+            if event_weeks and not weeks_intersect(event_weeks, inst.get("weeks") or set()):
+                continue
+            forbidden[inst["instance_id"]].update(slot_ids)
     return forbidden
 
 
@@ -1332,6 +1369,22 @@ def add_pairwise_week_conflicts(model: cp_model.CpModel, var_groups: list[list])
             model.Add(sum(vars_i) + sum(vars_j) <= 1)
 
 
+def add_weekly_resource_limit(
+    model: cp_model.CpModel,
+    var_groups: list[tuple[list, set[int]]],
+    *,
+    capacity: int = 1,
+) -> None:
+    """Enforce a resource capacity per actual week without pairwise constraints."""
+    vars_by_week: dict[int, list] = defaultdict(list)
+    for variables, weeks in var_groups:
+        for week in weeks:
+            vars_by_week[int(week)].extend(variables)
+    for variables in vars_by_week.values():
+        if len(variables) > capacity:
+            model.Add(sum(variables) <= capacity)
+
+
 def resolve_course_display_name(course: dict, source: dict | None = None) -> str:
     """
     Отображаемое имя занятия без обязательного courses[].name.
@@ -2182,7 +2235,21 @@ def validate_fixed_schedules(
             or normalize_duration_slots(entry.get("duration_slots"))
             or 1
         )
-        lessons = int(instances_per_course.get(course_id) or 0)
+        # fixed_schedules describes the set of weekly time slots shared by all
+        # instances/subgroups of the course.  It must not be multiplied by the
+        # number of subgroups: a PE course with 23 subgroups and two weekly
+        # lessons still has two fixed slot IDs, which every subgroup uses.
+        lessons = int(
+            course.get("lessons_per_week")
+            or next(
+                (
+                    instance.get("lessons_per_week")
+                    for instance in (course.get("instances") or [])
+                    if instance.get("lessons_per_week") is not None
+                ),
+                1,
+            )
+        )
         expected_slots = lessons * duration
         if len(slots) != expected_slots:
             errors.append({
@@ -2356,6 +2423,8 @@ def drop_unplaceable_instances(
             ) + " (unplaceable_instance_policy=warn)",
             "course_id": inst.get("course_id"),
             "entity_ids": [inst["instance_id"]],
+            "name": inst.get("name"),
+            "group_ids": list(inst.get("group_ids") or []),
             "students_needed": inst.get("total_students"),
             "requirements": list(inst.get("requirements") or []),
             "cause_code": err_code,
@@ -3058,54 +3127,58 @@ def solve_two_phase(
             if vars_for_slot:
                 model1.Add(sum(vars_for_slot) == 1)
 
-    def phase1_vars_covering(inst: dict, slot_id: int) -> list:
+    # Build resource indexes once. Scanning every instance for every teacher,
+    # group and slot made full-institute model construction needlessly O(S*R*I).
+    phase1_covering: dict[tuple[str, int], list] = defaultdict(list)
+    for inst in course_instances:
         duration = int(inst.get("duration_slots") or 1)
-        found = []
-        for start_id in (covering_by_duration.get(duration) or {}).get(slot_id, []):
-            key = (inst["instance_id"], start_id)
-            if key in y:
-                found.append(y[key])
-        return found
+        for slot_id, start_ids in (covering_by_duration.get(duration) or {}).items():
+            for start_id in start_ids:
+                var = y.get((inst["instance_id"], start_id))
+                if var is not None:
+                    phase1_covering[(inst["instance_id"], slot_id)].append(var)
 
-    # Teacher / group conflicts with weeks
-    teacher_ids = sorted({
-        tid for inst in course_instances for tid in instance_teacher_ids(inst)
-    })
-    group_ids = sorted({
-        gid for inst in course_instances for gid in (inst.get("group_ids") or [])
-    })
+    instances_by_teacher: dict[str, list[dict]] = defaultdict(list)
+    instances_by_group: dict[str, list[dict]] = defaultdict(list)
+    for inst in course_instances:
+        for teacher_id in set(instance_teacher_ids(inst)):
+            instances_by_teacher[teacher_id].append(inst)
+        for group_id in set(inst.get("group_ids") or []):
+            instances_by_group[group_id].append(inst)
+
     for slot in time_slots:
-        for teacher_id in teacher_ids:
-            teacher_var_groups = []
-            for inst in course_instances:
-                if teacher_id not in instance_teacher_ids(inst):
-                    continue
-                vars_i = phase1_vars_covering(inst, slot["id"])
-                if vars_i:
-                    teacher_var_groups.append((vars_i, instance_weeks(inst)))
-            add_pairwise_week_conflicts(model1, teacher_var_groups)
+        slot_id = slot["id"]
+        for resource_instances in instances_by_teacher.values():
+            var_groups = [
+                (phase1_covering[(inst["instance_id"], slot_id)], instance_weeks(inst))
+                for inst in resource_instances
+                if phase1_covering.get((inst["instance_id"], slot_id))
+            ]
+            if len(var_groups) > 1:
+                add_weekly_resource_limit(model1, var_groups)
 
-        for group_id in group_ids:
-            group_var_groups = []
-            for inst in course_instances:
-                if group_id not in (inst.get("group_ids") or []):
-                    continue
-                vars_i = phase1_vars_covering(inst, slot["id"])
-                if vars_i:
-                    group_var_groups.append((vars_i, instance_weeks(inst)))
-            add_pairwise_week_conflicts(model1, group_var_groups)
+        for resource_instances in instances_by_group.values():
+            var_groups = [
+                (phase1_covering[(inst["instance_id"], slot_id)], instance_weeks(inst))
+                for inst in resource_instances
+                if phase1_covering.get((inst["instance_id"], slot_id))
+            ]
+            if len(var_groups) > 1:
+                add_weekly_resource_limit(model1, var_groups)
 
     # Packing: физ. занятия в слоте ≤ число физ. аудиторий
     physical_room_n = len([room for room in rooms if not room.get("is_virtual")])
     if physical_room_n > 0:
         for slot in time_slots:
-            pack_vars = []
+            pack_groups = []
             for inst in course_instances:
                 if not inst.get("needs_physical_room", True):
                     continue
-                pack_vars.extend(phase1_vars_covering(inst, slot["id"]))
-            if pack_vars:
-                model1.Add(sum(pack_vars) <= physical_room_n)
+                variables = phase1_covering.get((inst["instance_id"], slot["id"])) or []
+                if variables:
+                    pack_groups.append((variables, instance_weeks(inst)))
+            if pack_groups:
+                add_weekly_resource_limit(model1, pack_groups, capacity=physical_room_n)
 
     # Gap soft on phase1 via synthetic x mapping
     # Reuse gap helper by adapting: build fake x from y
@@ -3279,21 +3352,20 @@ def solve_two_phase(
         model2.AddExactlyOne(vars_room)
 
     # Room conflicts on each occupied slot of the fixed blocks
-    for slot in time_slots:
-        for room in rooms:
-            if room.get("is_virtual"):
-                continue
-            var_groups = []
-            for inst in course_instances:
-                start_id = assigned_start[inst["instance_id"]]
-                duration = int(inst.get("duration_slots") or 1)
-                block = (blocks_by_duration.get(duration) or {}).get(start_id) or []
-                if slot["id"] not in {s["id"] for s in block}:
-                    continue
+    phase2_room_slot_groups: dict[tuple[str, int], list[tuple[list, set[int]]]] = defaultdict(list)
+    for inst in course_instances:
+        start_id = assigned_start[inst["instance_id"]]
+        duration = int(inst.get("duration_slots") or 1)
+        block = (blocks_by_duration.get(duration) or {}).get(start_id) or []
+        weeks = instance_weeks(inst)
+        for slot in block:
+            for room in domain_by_inst[inst["instance_id"]]:
                 key = (inst["instance_id"], room["id"])
-                if key in z:
-                    var_groups.append(([z[key]], instance_weeks(inst)))
-            add_pairwise_week_conflicts(model2, var_groups)
+                if key in z and not room.get("is_virtual"):
+                    phase2_room_slot_groups[(str(room["id"]), int(slot["id"]))].append(([z[key]], weeks))
+    for var_groups in phase2_room_slot_groups.values():
+        if len(var_groups) > 1:
+            add_weekly_resource_limit(model2, var_groups)
 
     # same_room on phase2
     physical_rooms = [room for room in rooms if not room.get("is_virtual")]
@@ -3452,6 +3524,10 @@ def solve_two_phase(
         "status": status_label,
         "errors": [],
         "warnings": all_warnings,
+        "unplaced": [
+            warning for warning in all_warnings
+            if warning.get("code") == "UNPLACEABLE_INSTANCE_DROPPED"
+        ],
         "schedule": schedule_result,
         "meta": {
             "solve_strategy": "two_phase",
@@ -3487,6 +3563,19 @@ def solve_schedule(input_json_str: str, config: dict | None = None) -> str:
     impossible_restrictions = data.get("teachers_impossible_slots") or []
     wanted_rows = data.get("teachers_wanted_slots") or []
     fixed_schedule_rows = list(data.get("fixed_schedules") or [])
+    fixed_events = list(data.get("fixed_schedule_events") or [])
+    preassigned_course_ids = {
+        str(event["course_id"])
+        for event in fixed_events
+        if event.get("course_id") is not None
+    }
+    # Imported institute-level PE entries are already scheduled. Keep them as
+    # group/slot reservations and export overlays; do not solve them a second time.
+    courses = [course for course in courses if str(course.get("id")) not in preassigned_course_ids]
+    fixed_schedule_rows = [
+        entry for entry in fixed_schedule_rows
+        if str(entry.get("course_id")) not in preassigned_course_ids
+    ]
     scope_warnings: list[dict] = []
     # Декомпозиция / срез для масштаба: только указанные course_id
     scope_ids = solver_config.get("scope_course_ids") or data.get("scope_course_ids")
@@ -3603,6 +3692,7 @@ def solve_schedule(input_json_str: str, config: dict | None = None) -> str:
     forbidden_slots_by_instance = collect_forbidden_slots_by_instance(
         course_instances,
         impossible_restrictions,
+        fixed_events,
     )
     wanted_prefs_by_instance, fixed_room_conflicts = collect_wanted_prefs_by_instance(
         course_instances,
@@ -3745,7 +3835,61 @@ def solve_schedule(input_json_str: str, config: dict | None = None) -> str:
         solver_config,
         estimated_vars=estimated_vars,
     )
-
+    max_estimated_vars = int(solver_config.get("max_estimated_vars") or 0)
+    estimated_phase1_vars = sum(
+        len(blocks_by_duration.get(int(inst.get("duration_slots") or 1)) or {})
+        for inst in course_instances
+    )
+    max_candidate_rooms = int(solver_config.get("max_candidate_rooms") or 0)
+    estimated_phase2_vars = (
+        len(course_instances) * max_candidate_rooms
+        if max_candidate_rooms > 0
+        else len(course_instances) * max(1, len([room for room in rooms if not room.get("is_virtual")]))
+    )
+    model_too_large = (
+        solve_strategy == "monolithic" and max_estimated_vars > 0 and estimated_vars > max_estimated_vars
+    ) or (
+        solve_strategy == "two_phase"
+        and max_estimated_vars > 0
+        and max(estimated_phase1_vars, estimated_phase2_vars) > max_estimated_vars
+    )
+    if model_too_large:
+        estimate_for_limit = estimated_vars if solve_strategy == "monolithic" else max(estimated_phase1_vars, estimated_phase2_vars)
+        error = {
+            "code": "MODEL_SIZE_LIMIT",
+            "message": (
+                f"Оценка модели ({estimate_for_limit:,} вариантов) превышает лимит "
+                f"MVP ({max_estimated_vars:,}); выберите scope по курсам или "
+                "уменьшите домены/ограничения или повышайте лимит после нагрузочного замера"
+            ),
+            "hints": [
+                "Для полной модели включён двухфазный режим: отдельно оцениваются слотные и аудиторные переменные",
+                "Сузьте scope_course_ids только если двухфазная оценка сама превышает лимит",
+                "Проверьте max_candidate_rooms и число занятий после импорта",
+            ],
+            "instances_count": len(course_instances),
+            "estimated_vars": estimated_vars,
+            "estimated_phase1_vars": estimated_phase1_vars,
+            "estimated_phase2_vars": estimated_phase2_vars,
+            "max_estimated_vars": max_estimated_vars,
+        }
+        return json.dumps(
+            failure_payload(
+                status="ERROR",
+                errors=[error],
+                warnings=solver_warnings,
+                meta={
+                    "instances_count": len(course_instances),
+                    "estimated_vars_monolithic": estimated_vars,
+                    "estimated_vars_phase1": estimated_phase1_vars,
+                    "estimated_vars_phase2": estimated_phase2_vars,
+                    "solve_strategy_selected": solve_strategy,
+                    "max_estimated_vars": max_estimated_vars,
+                },
+            ),
+            ensure_ascii=False,
+            indent=2,
+        )
     if solve_strategy == "two_phase":
         two_phase_result = solve_two_phase(
             course_instances=course_instances,
@@ -3770,7 +3914,10 @@ def solve_schedule(input_json_str: str, config: dict | None = None) -> str:
             return json.dumps(parsed_two, ensure_ascii=False, indent=2)
 
         # Repair: fallback на monolithic с остатком времени
-        if solver_config.get("repair_on_two_phase_fail", True):
+        repair_is_safe = (
+            max_estimated_vars <= 0 or estimated_vars <= max_estimated_vars
+        )
+        if solver_config.get("repair_on_two_phase_fail", True) and repair_is_safe:
             used = float(
                 (parsed_two.get("meta") or {}).get("solve_time_sec")
                 or (
@@ -3798,6 +3945,17 @@ def solve_schedule(input_json_str: str, config: dict | None = None) -> str:
                 "phase_errors": parsed_two.get("errors") or [],
             }]
         else:
+            if solver_config.get("repair_on_two_phase_fail", True) and not repair_is_safe:
+                parsed_two.setdefault("warnings", []).append({
+                    "code": "MONOLITHIC_FALLBACK_SKIPPED",
+                    "message": (
+                        "Monolithic fallback пропущен: его оценка превышает лимит памяти; "
+                        "возвращён результат двухфазного решателя"
+                    ),
+                    "estimated_vars_monolithic": estimated_vars,
+                    "max_estimated_vars": max_estimated_vars,
+                })
+                return json.dumps(parsed_two, ensure_ascii=False, indent=2)
             return two_phase_result
 
     # 3. Переменные: x[(inst, start_slot_id, room)] = блок duration начиная со start
@@ -4271,6 +4429,10 @@ def solve_schedule(input_json_str: str, config: dict | None = None) -> str:
             "status": status_label,
             "errors": [],
             "warnings": all_warnings,
+            "unplaced": [
+                warning for warning in all_warnings
+                if warning.get("code") == "UNPLACEABLE_INSTANCE_DROPPED"
+            ],
             "schedule": schedule_result,
             "meta": {
                 "solve_time_sec": round(solver.WallTime(), 3),
@@ -4340,7 +4502,51 @@ def solve_schedule(input_json_str: str, config: dict | None = None) -> str:
     )
 
 
+def main(argv: list[str] | None = None) -> int:
+    """Solve parser JSON and write a reviewable Excel workbook."""
+    parser = argparse.ArgumentParser(description="Собрать расписание из JSON парсера")
+    parser.add_argument("--input", type=Path, default=DEFAULT_DATA_PATH,
+                        help="Входной JSON (по умолчанию parser/data.json)")
+    parser.add_argument("--output", type=Path, default=Path("outputs/schedule.xlsx"),
+                        help="Excel с расписанием и диагностикой")
+    parser.add_argument("--json-output", type=Path, default=Path("outputs/result.json"),
+                        help="Полный JSON-ответ солвера")
+    parser.add_argument("--max-time", type=float, default=None,
+                        help="Лимит времени решателя в секундах")
+    parser.add_argument("--strategy", choices=["auto", "monolithic", "two_phase"],
+                        default=None, help="Стратегия построения модели")
+    parser.add_argument("--scope", default=None,
+                        help="Список course_id через запятую для демонстрационного среза")
+    args = parser.parse_args(argv)
+
+    data = load_data(args.input)
+    config: dict = {}
+    if args.max_time is not None:
+        config["max_time_in_seconds"] = args.max_time
+    if args.strategy:
+        config["solve_strategy"] = args.strategy
+    if args.scope:
+        config["scope_course_ids"] = [
+            course_id.strip() for course_id in args.scope.split(",") if course_id.strip()
+        ]
+
+    result = json.loads(solve_schedule(json.dumps(data, ensure_ascii=False), config))
+    result["reserved_events"] = list(data.get("fixed_schedule_events") or [])
+    args.json_output.parent.mkdir(parents=True, exist_ok=True)
+    args.json_output.write_text(
+        json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+    from exporter import export_result
+
+    export_result(result, args.output, data)
+    print(
+        f"{result.get('status', 'UNKNOWN')}: "
+        f"{len(result.get('schedule') or [])} занятий; "
+        f"{len(result.get('warnings') or [])} предупреждений; "
+        f"Excel: {args.output}; JSON: {args.json_output}"
+    )
+    return 0 if str(result.get("status", "")).startswith("SUCCESS") else 2
+
+
 if __name__ == "__main__":
-    data = prepare_parser_data(load_data())
-    output_json = solve_schedule(json.dumps(data, ensure_ascii=False))
-    print(output_json)
+    raise SystemExit(main())
