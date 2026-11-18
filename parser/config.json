@@ -1,0 +1,41 @@
+{
+  "hours": {
+    "unit_hours": 32,
+    "below_16_policy": "biweekly",
+    "biweekly_start": "odd",
+    "exact": {
+      "16": {"lessons_per_week": 1, "week_pattern": "biweekly"},
+      "32": {"lessons_per_week": 1, "week_pattern": "weekly"},
+      "48": {"lessons_per_week": 2, "week_pattern": "weekly"},
+      "64": {"lessons_per_week": 2, "week_pattern": "weekly"},
+      "96": {"lessons_per_week": 3, "week_pattern": "weekly"},
+      "108": {"lessons_per_week": 4, "week_pattern": "weekly"}
+    },
+    "ranges": [
+      {"min": 17, "max": 31, "lessons_per_week": 1, "week_pattern": "weekly"},
+      {"min": 33, "max": 47, "lessons_per_week": 2, "week_pattern": "weekly"},
+      {"min": 49, "max": 63, "lessons_per_week": 2, "week_pattern": "weekly"},
+      {"min": 65, "max": 95, "lessons_per_week": 3, "week_pattern": "weekly"},
+      {"min": 97, "max": 128, "lessons_per_week": 4, "week_pattern": "weekly"}
+    ],
+    "long_lab": {
+      "use_comment_hint": true,
+      "default_duration_slots": 1
+    }
+  },
+  "missing_teacher": {
+    "policy": "soft",
+    "placeholder": "UNKNOWN:{course_id}",
+    "whitelist": {
+      "venue_types": ["online", "external"],
+      "course_names": ["Прикладная физическая культура (практика)"],
+      "lesson_types": []
+    }
+  },
+  "pair_grid": {
+    "unsupported_pair_policy": "warn"
+  },
+  "session": {
+    "enabled": true
+  }
+}
