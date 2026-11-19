@@ -1,300 +1,53 @@
-import argparse
 import json
 import math
 import re
-from pathlib import Path
 from os import PathLike
+from pathlib import Path
 
 import pandas as pd
+
+from parser.entities.default_config import DEFAULT_PARSER_CONFIG
+from parser.entities.table_entities import Entities
 
 
 class ParserValidationError(ValueError):
     """Raised when parser output cannot be handed to the solver."""
 
 
-DEFAULT_PARSER_CONFIG = {
-    "hours": {
-        "unit_hours": 32,
-        "below_16_policy": "biweekly",
-        "biweekly_start": "odd",
-        "exact": {
-            "16": {"lessons_per_week": 1, "week_pattern": "biweekly"},
-            "32": {"lessons_per_week": 1, "week_pattern": "weekly"},
-            "48": {"lessons_per_week": 2, "week_pattern": "weekly"},
-            "64": {"lessons_per_week": 2, "week_pattern": "weekly"},
-            "96": {"lessons_per_week": 3, "week_pattern": "weekly"},
-            "108": {"lessons_per_week": 4, "week_pattern": "weekly"},
-        },
-        "ranges": [
-            {"min": 17, "max": 31, "lessons_per_week": 1, "week_pattern": "weekly"},
-            {"min": 33, "max": 47, "lessons_per_week": 2, "week_pattern": "weekly"},
-            {"min": 49, "max": 63, "lessons_per_week": 2, "week_pattern": "weekly"},
-            {"min": 65, "max": 95, "lessons_per_week": 3, "week_pattern": "weekly"},
-            {"min": 97, "max": 128, "lessons_per_week": 4, "week_pattern": "weekly"},
-        ],
-        "long_lab": {"use_comment_hint": True, "default_duration_slots": 1},
-    },
-    "missing_teacher": {
-        "policy": "soft",
-        "placeholder": "UNKNOWN:{course_id}",
-        "whitelist": {
-            "venue_types": ["online", "external"],
-            "course_names": ["Прикладная физическая культура (практика)"],
-            "lesson_types": [],
-        },
-    },
-    "pair_grid": {"unsupported_pair_policy": "warn"},
-    "session": {"enabled": True},
-}
-
-
 class Importer:
     """Read the course load, room catalog and teacher preferences from XLSX."""
 
-    data_dir = Path(__file__).resolve().parent / "tables"
-    config_file = Path(__file__).resolve().parent / "config.json"
-    rooms_file = data_dir / "table2.xlsx"
-    rooms_sheet = "Аудитории"
-    courses_file = data_dir / "table.xlsx"
-    desires_file = data_dir / "table3.xlsx"
-    pe_sheet = "Физ.культура"
-    pe_institute = "ИЕНиМ"
-    course_sheets = ["ХИМИКИ", "ФИНЗ", "ФИНЗ Магистры", "ЭБМ", "Тургенева 4 по выбору", "Тургенева 4"]
-    days = ["ПОНЕДЕЛЬНИК", "ВТОРНИК", "СРЕДА", "ЧЕТВЕРГ", "ПЯТНИЦА", "СУББОТА"]
-    default_group_size = 30
-    fixed_course_names = {"Прикладная физическая культура (практика)"}
-
-    feature_columns = ["has_chalkboard", "has_whiteboard", "has_multimedia_board",
-                       "has_blinds", "has_screen", "has_acoustic_system"]
-    room_renames = {"Ауд.": "id", "Вид": "type", "Вм-ть": "capacity",
-                    "меловая": "has_chalkboard",
-                    "маркерная": "has_whiteboard", "мультимедиа": "has_multimedia_board",
-                    "жалюзи": "has_blinds", "экран": "has_screen", "акустич. система": "has_acoustic_system"}
-    dropped_room_columns = ["Кому принадлежит", "С кем договариваться", "Примечание"]
-    teacher_columns = {"лекция": "ФИО лектора", "практика": "ФИО преподавателя на практики, лаборатории",
-                       "лабораторная": "ФИО преподавателя на практики, лаборатории"}
-    hours_columns = {"лекция": "Лекции", "практика": "Практ. занятия", "лабораторная": "Лаб. занятия"}
-    group_column = "Номер группы"
-    discipline_column = "Дисциплины"
-    students_column = "Число студентов"
-    projector_column = "Нужен ли проектор на практики, лаборатории"
-    multimedia_column = "Нужна ли мультимедиа на лекции?"
-    board_column = "Какая нужна доска на практики, лаборатории: меловая, маркерная, любая"
-    software_column = "ПО на практики, лаборатории"
-    location_column = "Где проводятся практики, лаборатории?"
-    ntk_column = "НТК"
-    delivery_model_column = "Модель реализации"
-    time_wish_column = ("Пожелания по времени пар (дни недели, утро/вечер, "
-                        "середина дня, ограничения по кол-ву пар в день "
-                        "по медицинским показаниям)")
-    comments_column = "Комментарий, особенности дисциплины"
-    room_requirement_labels = {
-        "любая доска": "board", "меловая доска": "chalkboard",
-        "маркерная доска": "whiteboard", "мультимедиа доска": "multimedia_board",
-        "экран": "screen", "жалюзи": "blinds", "акустическая система": "acoustic_system",
-    }
-    room_ref_pattern = re.compile(
-        r"(?<!\d)\d{3}(?:/\d{1,2})?(?:\s?[а-яё](?![а-яё]))?(?!\d)", re.IGNORECASE)
-    same_room_pattern = re.compile(
-        r"(?:вместе\s+с\s+лекц\w*|там\s+же[,\s]*где\s+и\s+лекц\w*|"
-        r"как\s+и\s+лекц\w*|где\s+и\s+лекц\w*|как\s+лекц\w*)", re.IGNORECASE)
-    generic_location_pattern = re.compile(
-        r"^\s*(?:любая|в\s+|аудитория|аудиторно|ауд\b|обычн|онлайн|online|"
-        r"нет|не\s+проводится|уточняется|больш|класс|кабинет|комп|ивц|"
-        r"ит-центр|информационн|тургенева|куйбышева|литер|корпус|этаж|"
-        r"\d+\s*этаж|отдельн|на\s|лабораторн|практик|лекци)", re.IGNORECASE)
-    # Canonical header -> accepted variants. Variants that differ only by case,
-    # whitespace or "ё" are matched by _normalize_header without an explicit entry.
-    header_aliases = {
-        "Курс": ("Курс обучения",),
-        "Номер группы": ("№ группы", "Группа"),
-        "Число студентов": ("Количество студентов", "Численность студентов"),
-        "Дисциплины": ("Дисциплина", "Наименование дисциплины"),
-        "Лекции": ("Лекционные занятия", "Лекции, ч"),
-        "Практ. занятия": ("Практические занятия", "Практ. занятия, ч"),
-        "Лаб. занятия": ("Лабораторные занятия", "Лаб. занятия, ч"),
-        "Зачет / экзамен": ("зачет /экзамен", "Зачёт/экзамен",
-                            "Отчетное мероприятие: Зачет / экзамен"),
-        "ФИО лектора": ("Лектор",),
-        "ФИО преподавателя на практики, лаборатории": (
-            "ФИО преподавателя на практики/лаборатории",
-            "ФИО преподавателя на практические занятия, лаборатории"),
-        "Нужна ли мультимедиа на лекции?": ("Нужна ли мультимедиа на лекции",),
-        "Нужен ли проектор на практики, лаборатории": (
-            "Нужен ли проектор на практики, лаборатории?",),
-        "Какая нужна доска на практики, лаборатории: меловая, маркерная, любая": (
-            "Какая нужна доска на практики, лаборатории: меловая, маркерная или любая",),
-        "Кол-во подгрупп на практич и лаб. занятия": (
-            "Кол-во подгрупп на практические и лабораторные занятия",),
-    }
-    subgroup_column = "Кол-во подгрупп на практич и лаб. занятия"
-    # Session / report columns are isolated from weekly courses (п.13).
-    session_field_markers = (
-        ("teacher_name", ("принимающего отчетное",)),
-        ("time_window_raw", ("время начала",)),
-        ("consultation_raw", ("консультация",)),
-        ("free_days_min", ("свободных дней",)),
-        ("room_requirement_raw", ("какая нужна аудитория",)),
-        ("scope_raw", ("особенности проведения",)),
-        ("date_windows_raw", ("поставить отчетные",)),
-        ("restrictions_raw", ("ограничения по датам",)),
-        ("note_raw", ("дополнительные особенности", "примечание:")),
-        ("report_format", ("вид отчетного",)),
-        ("report_type", ("зачет / экзамен", "зачет /экзамен", "отчетное мероприятие")),
-    )
-    teacher_segment_pattern = re.compile(
-        r"[,;\n]+|\s+или\s+|\s*\+\s*|(?<![А-Яа-яЁё])/(?![А-Яа-яЁё])")
-    teacher_name_pattern = re.compile(
-        r"(?:"
-        r"[А-ЯЁA-Z][а-яёa-z-]+"
-        r"(?:"
-        r"\s+[А-ЯЁA-Z]\.(?:\s*[А-ЯЁA-Z]\.?(?![а-яёa-z]))?"
-        r"|\s+[А-ЯЁA-Z]\s?[А-ЯЁA-Z](?![а-яёa-z])"
-        r")"
-        r"|"
-        r"[А-ЯЁA-Z]\.(?:\s*[А-ЯЁA-Z]\.)?\s*[А-ЯЁA-Z][а-яёa-z-]+"
-        r")")
-    latin_name_letters = str.maketrans(
-        {"A": "А", "B": "В", "C": "С", "E": "Е", "H": "Н", "K": "К",
-         "M": "М", "O": "О", "P": "Р", "T": "Т", "X": "Х"})
-    initials_first_pattern = re.compile(
-        r"^([А-ЯЁA-Z]\.)\s*([А-ЯЁA-Z]\.)?\s*([А-ЯЁA-Z][а-яёa-z-]+)$")
-    dotless_initials_pattern = re.compile(
-        r"^([А-ЯЁA-Z][а-яёa-z-]+)\s+([А-ЯЁA-Z])\s?([А-ЯЁA-Z])$")
-    teacher_full_name_pattern = re.compile(
-        r"[А-ЯЁ][а-яё-]+\s+[А-ЯЁ][а-яё-]+(?:\s+[А-ЯЁ][а-яё-]+)?")
-    team_marker_pattern = re.compile(
-        r"(?P<count>\d+)?\s*(?P<kind>команд\w*|подгрупп\w*|подгр\w*|п/гр\w*|групп\w*)",
-        re.IGNORECASE)
-    parenthesized_count_pattern = re.compile(r"\(\s*(\d+)\s*\)")
-    subgroup_type_pattern = re.compile(r"\b(лаб\w*|практ\w*|пр\.)", re.IGNORECASE)
-
-    # --- Пункт 9: тип площадки ------------------------------------------------
-    venue_online_pattern = re.compile(
-        r"(?:^|[^\w])(?:онлайн|online|дистанционн\w*|в\s+онлайн[-\s]?формате)(?:[^\w]|$)")
-    venue_room_pattern = re.compile(
-        r"аудитор|ауд\b|класс|кабинет|лаборатор|очно|ивц|ит-центр|"
-        r"этаж|корпус|доск|проектор|любая|больш|обычн|тургенева|куйбышева|литер")
-    venue_campus_pattern = re.compile(r"тургенева|куйбышева|литер")
-    venue_external_pattern = re.compile(
-        r"\b(?:имм\s+уро\s+ран|уро\s+ран|униим|ран)\b|"
-        r"\b(?:ооо|ао|пао|зао)\b|на\s+предприятии|в\s+организации|обсерватори")
-    venue_comment_external_pattern = re.compile(
-        r"занятия\s+(?:проводятся|проходят)\s+в\s+"
-        r"(?:имм\s+уро\s+ран|униим|ран|ооо|ао|пао|зао|организации|институте)")
-    venue_no_room_pattern = re.compile(r"^\s*(?:нет|не\s+требуется|не\s+проводится)\s*$")
-
-    # --- Пункт 10: пожелания по времени --------------------------------------
-    day_patterns = (
-        ("ПОНЕДЕЛЬНИК", re.compile(r"\b(?:понедельник\w*|понед\w*|пн)\b", re.IGNORECASE)),
-        ("ВТОРНИК", re.compile(r"\b(?:вторник\w*|вт)\b", re.IGNORECASE)),
-        ("СРЕДА", re.compile(r"\b(?:сред[аыуе]\w*|ср)\b", re.IGNORECASE)),
-        ("ЧЕТВЕРГ", re.compile(r"\b(?:четверг\w*|четвер\w*|чт)\b", re.IGNORECASE)),
-        ("ПЯТНИЦА", re.compile(r"\b(?:пятниц\w*|пятн\w*|пт)\b", re.IGNORECASE)),
-        ("СУББОТА", re.compile(r"\b(?:суббот\w*|суб\w*|сб)\b", re.IGNORECASE)),
-    )
-    pair_word_values = {
-        "перв": 1, "втор": 2, "трет": 3, "четверт": 4, "пят": 5, "шест": 6,
-    }
-    pair_count_word_values = {
-        "два": 2, "две": 2, "три": 3, "четыре": 4, "пять": 5, "шесть": 6,
-    }
-    pair_range_pattern = re.compile(
-        r"(?<![\d,.])(\d{1,2})(?:\s*[-–]\s*(\d{1,2}))?"
-        r"\s*(?:-?(?:й|я|ю|ой|ий|ая|ую))?\s*пар(?:а|ы|у|ам|ами|е)?\b",
-        re.IGNORECASE)
-    pair_word_pattern = re.compile(
-        r"\b(перв|втор|трет|четверт|пят|шест)\w*\s+пар(?:а|ы|у|ам|ами|е)?\b",
-        re.IGNORECASE)
-    pair_count_word_pattern = re.compile(
-        r"\b(?:первые|первых)?\s*(два|две|три|четыре|пять|шесть)\s+"
-        r"пар(?:а|ы|у|ам|ами|е)?\b", re.IGNORECASE)
-    pair_bound_pattern = re.compile(
-        r"\b(?P<prep>не\s+раньше|не\s+ранее|не\s+позже|не\s+позднее|"
-        r"начиная\s+со?|после|со?|до)\s+"
-        r"(?:(?P<num>\d{1,2})|(?P<word>перв\w*|втор\w*|трет\w*|"
-        r"четверт\w*|пят\w*|шест\w*))\s+пар(?:а|ы|у|ам|ами|е)?\b",
-        re.IGNORECASE)
-    time_clause_pattern = re.compile(
-        r"\b(?P<prep>не\s+раньше|не\s+ранее|не\s+позже|не\s+позднее|"
-        r"начиная\s+со?|после|со?|до)\s+"
-        r"(?P<hour>\d{1,2})(?:[:.](?P<minute>\d{2})|-(?P<minute2>\d{2}))",
-        re.IGNORECASE)
-    max_pairs_day_pattern = re.compile(
-        r"\b(?:не\s+более|не\s+больше|максимум|макс\.?)\s+"
-        r"(\d{1,2})\s+пар(?:ы)?\s+в\s+день\b", re.IGNORECASE)
-    day_part_patterns = (
-        ("morning", re.compile(
-            r"\bутр\w*|перв(?:ая|ой|ую)?\s+половин\w*\s+(?:дня|день)",
-            re.IGNORECASE)),
-        ("afternoon", re.compile(
-            r"втор(?:ая|ой|ую)?\s+половин\w*\s+(?:дня|день)|"
-            r"после\s+обеда|середин\w*\s+(?:дня|день)|"
-            r"\bднем\b", re.IGNORECASE)),
-        ("evening", re.compile(r"\bвечер\w*", re.IGNORECASE)),
-    )
-    wish_negation_pattern = re.compile(
-        r"\bне\b|нельзя|нежелат|исключ|кроме|запрещ", re.IGNORECASE)
-    wish_soft_pattern = re.compile(
-        r"по\s+возможности|желательно|лучше|предпочтительн\w*",
-        re.IGNORECASE)
-    wish_positive_pattern = re.compile(
-        r"\b(?:по)?ставить\b|\bставим\b|\bжелательно\b|\bлучше\b|"
-        r"\bпредпочтительн\w*|\bможно\b", re.IGNORECASE)
-    wish_segment_pattern = re.compile(r"[;\n]+|(?<=\.)\s+(?=[А-ЯЁA-Z0-9])")
-
-    # --- Пункт 11: комментарии -----------------------------------------------
-    comment_online_pattern = re.compile(
-        r"\bонлайн\b|\bonline\b|в\s+контур\b|"
-        r"дистанционн\w*\s+(?:формат\w*|обучен\w*|занят\w*|курс\w*|"
-        r"проведен\w*|режим\w*)", re.IGNORECASE)
-    comment_duration_hours_pattern = re.compile(
-        r"(\d+(?:[.,]\d+)?)\s*(?:ак\.?\s*)?час\w*")
-    comment_duration_double_pattern = re.compile(
-        r"сдвоен\w*|пар\w*\s+подряд|подряд\s+пар\w*|без\s+окна")
-    comment_duration_half_pattern = re.compile(
-        r"полтор\w*\s+пар\w*|1[.,]5\s+пар\w*")
-    comment_duration_pairs_pattern = re.compile(
-        r"(?:по\s+)?(две|три|четыре|пять|шесть|\d+)\s+пар\w*\s+подряд")
-    comment_period_pattern = re.compile(
-        r"\bс\s+(\d{1,2}\.\d{1,2}\.\d{2,4})\s+по\s+"
-        r"(\d{1,2}\.\d{1,2}\.\d{2,4})")
-    comment_week_range_patterns = (
-        re.compile(r"\bс\s+(\d{1,2})\s+по\s+(\d{1,2})\s+недел"),
-        re.compile(r"\b(\d{1,2})\s*[-–]\s*(\d{1,2})\s+недел"),
-    )
-    comment_week_chain_pattern = re.compile(
-        r"\bс\s+(\d{1,2})\s+по\s+(\d{1,2})(?=\s*(?:,|и|недел))",
-        re.IGNORECASE)
-    comment_week_list_pattern = re.compile(
-        r"\bнедели\s+([\d,\s\-–и]+)", re.IGNORECASE)
-    comment_semester_half_pattern = re.compile(
-        r"(перв|втор)\w*\s+половин\w*\s+семестра")
-
-    def __init__(self, rooms_file: str | PathLike = rooms_file, rooms_sheet: str = rooms_sheet,
-                 courses_file: str | PathLike = courses_file, course_sheets: list[str] | None = None,
-                 days: list[str] | None = None, save_path: str | PathLike | None = None,
-                 desires_file: str | PathLike | None = desires_file, fixed_course_names: set[str] | None = None,
-                 default_group_size: int = default_group_size,
-                 pe_sheet: str | None = pe_sheet, pe_institute: str = pe_institute,
-                 config: dict | str | PathLike | None = None,
-                 parse_room_occupancy: bool = False):
+    def __init__(
+            self,
+            rooms_file: str | PathLike = Entities.rooms_file,
+            rooms_sheet: str = Entities.rooms_sheet,
+            courses_file: str | PathLike = Entities.courses_file,
+            course_sheets: list[str] | None = None,
+            days: list[str] | None = None,
+            save_path: str | PathLike | None = None,
+            desires_file: str | PathLike | None = Entities.desires_file,
+            fixed_course_names: set[str] | None = None,
+            default_group_size: int = Entities.default_group_size,
+            pe_sheet: str | None = Entities.pe_sheet,
+            pe_institute: str = Entities.pe_institute,
+            config: dict | str | PathLike | None = None,
+            parse_room_occupancy: bool = False
+    ):
         self.rooms_file = rooms_file
         self.rooms_sheet = rooms_sheet
         self.courses_file = courses_file
         self.desires_file = desires_file
         self.pe_sheet = pe_sheet
         self.pe_institute = pe_institute
-        self.course_sheets = list(course_sheets) if course_sheets is not None else list(type(self).course_sheets)
-        self.days = list(days) if days is not None else list(type(self).days)
-        self.save_path = Path(save_path) if save_path is not None \
-            else Path(__file__).resolve().parent / "data.json"
+        self.course_sheets = list(course_sheets) if course_sheets is not None else Entities.course_sheets
+        self.days = list(days) if days is not None else Entities.days
+        self.save_path = Path(save_path) if save_path is not None else Path(__file__).resolve().parent / "data.json"
         self.fixed_course_names = set(fixed_course_names) \
-            if fixed_course_names is not None \
-            else set(type(self).fixed_course_names)
+            if fixed_course_names is not None else Entities.fixed_course_names
         self.default_group_size = int(default_group_size)
         self.config = self._load_config(config)
         self.parse_room_occupancy = bool(parse_room_occupancy)
+
         self._teachers: dict[str, dict] = {}
         self._groups: dict[str, dict] = {}
         self._course_count = 0
@@ -314,7 +67,7 @@ class Importer:
         """Load parser config.json and deep-merge it over the built-in defaults."""
         user_config: dict = {}
         if config is None:
-            path = Path(cls.config_file)
+            path = Path(Entities.config_file)
             if path.exists():
                 with path.open(encoding="utf-8") as file:
                     user_config = json.load(file)
@@ -473,16 +226,16 @@ class Importer:
         return result
 
     def _parse_rooms(self, rooms: pd.DataFrame) -> list[dict]:
-        rooms = rooms.drop(self.days + self.dropped_room_columns, axis=1, level=0)
+        rooms = rooms.drop(self.days + Entities.dropped_room_columns, axis=1, level=0)
         rooms.columns = [top if "Unnamed" in str(bottom) else bottom for top, bottom in rooms.columns]
-        rooms = rooms.dropna(subset=["Ауд."]).rename(columns=self.room_renames)
+        rooms = rooms.dropna(subset=["Ауд."]).rename(columns=Entities.room_renames)
         rooms["id"] = rooms["id"].map(self._normalize_room_id)
         rooms = rooms[rooms["id"].notna() & ~rooms["id"].astype(str).eq("")]
         # The sheet contains one empty duplicate row (e.g. room 369); keep the
         # richest row per id so the solver never sees two rooms with one id.
         rooms = rooms.assign(_filled=rooms.notna().sum(axis=1))
         rooms = rooms.sort_values("_filled", ascending=False).drop_duplicates("id", keep="first")
-        for column in self.feature_columns:
+        for column in Entities.feature_columns:
             if column not in rooms:
                 rooms[column] = False
             else:
@@ -499,7 +252,7 @@ class Importer:
             record = {"id": row["id"], "type": self._normalize_room_type(row.get("type")),
                       "capacity": None if pd.isna(capacity.loc[row.name])
                       else int(capacity.loc[row.name])}
-            record.update({column: bool(row.get(column, False)) for column in self.feature_columns})
+            record.update({column: bool(row.get(column, False)) for column in Entities.feature_columns})
             record["has_board"] = (record["has_chalkboard"] or record["has_whiteboard"]
                                    or record["has_multimedia_board"])
             records.append(record)
@@ -571,11 +324,11 @@ class Importer:
                     continue
                 df = pd.read_excel(workbook, sheet_name=sheet_name)
                 df = self._normalize_headers(df)
-                if self.discipline_column not in df or self.group_column not in df:
+                if Entities.discipline_column not in df or Entities.group_column not in df:
                     raise ValueError(f"Лист {sheet_name!r}: отсутствует колонка дисциплины или группы")
-                df[self.discipline_column] = df[self.discipline_column].ffill()
+                df[Entities.discipline_column] = df[Entities.discipline_column].ffill()
                 session_columns = self._session_columns(df) if session_enabled else {}
-                for _, row in df.dropna(subset=[self.group_column]).iterrows():
+                for _, row in df.dropna(subset=[Entities.group_column]).iterrows():
                     row_courses, session = self._parse_row(row, sheet_name, session_columns)
                     courses.extend(row_courses)
                     if session is None:
@@ -598,9 +351,9 @@ class Importer:
 
     def _parse_row(self, row: pd.Series, sheet_name: str,
                    session_columns: dict | None = None) -> tuple[list[dict], dict | None]:
-        counts = self._parse_students_count(row.get(self.students_column))
+        counts = self._parse_students_count(row.get(Entities.students_column))
         result = []
-        for lesson_type, column in self.hours_columns.items():
+        for lesson_type, column in Entities.hours_columns.items():
             hours = self._parse_hours(row.get(column))
             if hours is None:
                 self._count_skipped_hours(sheet_name, column, "empty")
@@ -632,7 +385,7 @@ class Importer:
         mapping: dict[str, list[str]] = {}
         for column in df.columns:
             key = self._name_key(column)
-            for field, markers in self.session_field_markers:
+            for field, markers in Entities.session_field_markers:
                 if any(marker in key for marker in markers):
                     mapping.setdefault(field, []).append(column)
                     break
@@ -665,7 +418,7 @@ class Importer:
             text = self._text_cell(row.get(column))
             if not text:
                 continue
-            periods = self.comment_period_pattern.findall(text)
+            periods = Entities.comment_period_pattern.findall(text)
             parsed = False
             for start, end in periods:
                 start_iso, end_iso = self._iso_date(start), self._iso_date(end)
@@ -685,7 +438,7 @@ class Importer:
         if not values and not date_windows:
             return None
 
-        raw_groups = row.get(self.group_column)
+        raw_groups = row.get(Entities.group_column)
         group_ids = [] if pd.isna(raw_groups) else [
             group for group in re.split(r"[\s,;\n]+", str(raw_groups).strip()) if group]
         free_days_value = values.get("free_days_min")
@@ -695,7 +448,7 @@ class Importer:
             "id": f"s{self._session_count}",
             "sheet": sheet_name,
             "course_ids": list(course_ids),
-            "discipline": self._clean_discipline(row.get(self.discipline_column)) or None,
+            "discipline": self._clean_discipline(row.get(Entities.discipline_column)) or None,
             "group_ids": group_ids,
             "report_type": values.get("report_type"),
             "teacher_name": values.get("teacher_name"),
@@ -1169,7 +922,7 @@ class Importer:
             return int(match.group("num"))
         if "word" in match.groupdict() and match.group("word"):
             word = match.group("word")
-            for prefix, value in self.pair_word_values.items():
+            for prefix, value in Entities.pair_word_values.items():
                 if word.startswith(prefix):
                     return value
             return None
@@ -1179,14 +932,14 @@ class Importer:
                 return int(value)
         for value in groups:
             if value:
-                for prefix, number in self.pair_word_values.items():
+                for prefix, number in Entities.pair_word_values.items():
                     if str(value).startswith(prefix):
                         return number
         return None
 
     def _wish_day_hits(self, text: str) -> list[dict]:
         hits: list[dict] = []
-        for day, pattern in self.day_patterns:
+        for day, pattern in Entities.day_patterns:
             for match in pattern.finditer(text):
                 hits.append({"day": day, "start": match.start(), "end": match.end()})
         hits.sort(key=lambda item: (item["start"], item["end"]))
@@ -1242,10 +995,10 @@ class Importer:
         chunk = text[chunk_start:chunk_end]
 
         last_negation = -1
-        for match in self.wish_negation_pattern.finditer(prefix):
+        for match in Entities.wish_negation_pattern.finditer(prefix):
             last_negation = match.start()
         last_positive = -1
-        for match in self.wish_positive_pattern.finditer(prefix):
+        for match in Entities.wish_positive_pattern.finditer(prefix):
             before = prefix[max(0, match.start() - 10):match.start()]
             if re.search(r"(?:^|\s)(?:не|нельзя)\s*$", before, re.IGNORECASE):
                 continue
@@ -1256,9 +1009,9 @@ class Importer:
         return last_positive <= last_negation
 
     def _wish_segment_polarity(self, text: str) -> bool | None:
-        has_negation = bool(self.wish_negation_pattern.search(text))
+        has_negation = bool(Entities.wish_negation_pattern.search(text))
         positive = False
-        for match in self.wish_positive_pattern.finditer(text):
+        for match in Entities.wish_positive_pattern.finditer(text):
             before = text[max(0, match.start() - 10):match.start()]
             if not re.search(r"(?:^|\s)(?:не|нельзя)\s*$", before, re.IGNORECASE):
                 positive = True
@@ -1299,7 +1052,7 @@ class Importer:
         return matches[0] if len(matches) == 1 else exact
 
     def _group_wish_teachers(self, segment: str) -> list[tuple[list[str], str]]:
-        matches = list(self.teacher_name_pattern.finditer(segment))
+        matches = list(Entities.teacher_name_pattern.finditer(segment))
         if not matches:
             return [([], segment)]
         groups: list[tuple[list[str], str]] = []
@@ -1351,19 +1104,19 @@ class Importer:
             clauses.append({"kind": kind, "start": match.start(), "end": match.end(),
                             "match": match, "priority": priority, **extra})
 
-        for match in self.max_pairs_day_pattern.finditer(text):
+        for match in Entities.max_pairs_day_pattern.finditer(text):
             add("max_pairs", match, 0)
-        for match in self.pair_bound_pattern.finditer(text):
+        for match in Entities.pair_bound_pattern.finditer(text):
             add("pair_bound", match, 0)
-        for match in self.time_clause_pattern.finditer(text):
+        for match in Entities.time_clause_pattern.finditer(text):
             add("time", match, 0)
-        for match in self.pair_count_word_pattern.finditer(text):
+        for match in Entities.pair_count_word_pattern.finditer(text):
             add("pair_range", match, 1)
-        for match in self.pair_range_pattern.finditer(text):
+        for match in Entities.pair_range_pattern.finditer(text):
             add("pair_range", match, 1)
-        for match in self.pair_word_pattern.finditer(text):
+        for match in Entities.pair_word_pattern.finditer(text):
             add("pair_range", match, 1)
-        for part, pattern in self.day_part_patterns:
+        for part, pattern in Entities.day_part_patterns:
             for match in pattern.finditer(text):
                 add("day_part", match, 2, part=part)
 
@@ -1437,24 +1190,21 @@ class Importer:
                     elif days:
                         reasons.append("preferred_day_pair")
                     else:
-                        fields["min_pair_index"] = max(
-                            fields["min_pair_index"] or 1, target)
+                        fields["min_pair_index"] = max(fields["min_pair_index"] or 1, target)
                 elif "до" in prep:
                     if clause_negative:
                         forbid(range(1, value + 1), days or None)
                     elif days:
                         reasons.append("preferred_day_pair")
                     else:
-                        fields["max_pair_index"] = min(
-                            fields["max_pair_index"] or max_pair, value)
+                        fields["max_pair_index"] = min(fields["max_pair_index"] or max_pair, value)
                 else:  # "с" / "начиная с"
                     if clause_negative:
                         forbid(range(value, max_pair + 1), days or None)
                     elif days:
                         reasons.append("preferred_day_pair")
                     else:
-                        fields["min_pair_index"] = max(
-                            fields["min_pair_index"] or 1, value)
+                        fields["min_pair_index"] = max(fields["min_pair_index"] or 1, value)
                 continue
 
             if clause["kind"] == "time":
@@ -1475,8 +1225,7 @@ class Importer:
                     elif days:
                         reasons.append("preferred_day_slot")
                     else:
-                        fields["min_pair_index"] = max(
-                            fields["min_pair_index"] or 1, target)
+                        fields["min_pair_index"] = max(fields["min_pair_index"] or 1, target)
                 elif lexical_max or prep == "до" and not clause_negative:
                     target = self._pair_from_minutes(minutes, "le")
                     if target is None:
@@ -1484,8 +1233,7 @@ class Importer:
                     elif days:
                         reasons.append("preferred_day_slot")
                     else:
-                        fields["max_pair_index"] = min(
-                            fields["max_pair_index"] or max_pair, target)
+                        fields["max_pair_index"] = min(fields["max_pair_index"] or max_pair, target)
                 elif prep == "после":
                     target = self._pair_from_minutes(minutes, "gt")
                     if target is None:
@@ -1495,8 +1243,7 @@ class Importer:
                     elif days:
                         reasons.append("preferred_day_slot")
                     else:
-                        fields["min_pair_index"] = max(
-                            fields["min_pair_index"] or 1, target)
+                        fields["min_pair_index"] = max(fields["min_pair_index"] or 1, target)
                 elif prep in {"с", "начиная с"}:
                     target = self._pair_from_minutes(minutes, "ge")
                     if target is None:
@@ -1506,8 +1253,7 @@ class Importer:
                     elif days:
                         reasons.append("preferred_day_slot")
                     else:
-                        fields["min_pair_index"] = max(
-                            fields["min_pair_index"] or 1, target)
+                        fields["min_pair_index"] = max(fields["min_pair_index"] or 1, target)
                 else:  # "до"
                     target = self._pair_from_minutes(minutes, "le")
                     if target is None:
@@ -1517,21 +1263,20 @@ class Importer:
                     elif days:
                         reasons.append("preferred_day_slot")
                     else:
-                        fields["max_pair_index"] = min(
-                            fields["max_pair_index"] or max_pair, target)
+                        fields["max_pair_index"] = min(fields["max_pair_index"] or max_pair, target)
                 continue
 
             if clause["kind"] == "pair_range":
                 if self._wish_is_frequency(text, match):
                     continue
-                if match.re is self.pair_count_word_pattern:
+                if match.re is Entities.pair_count_word_pattern:
                     word = match.group(1)
-                    value = self.pair_count_word_values.get(word)
+                    value = Entities.pair_count_word_values.get(word)
                     if value is None:
                         reasons.append("invalid_pair")
                         continue
                     low, high = 1, value
-                elif match.re is self.pair_word_pattern:
+                elif match.re is Entities.pair_word_pattern:
                     value = self._wish_pair_value(match)
                     if value is None:
                         reasons.append("invalid_pair")
@@ -1547,10 +1292,8 @@ class Importer:
                 elif days:
                     reasons.append("preferred_day_slot")
                 else:
-                    fields["min_pair_index"] = max(
-                        fields["min_pair_index"] or 1, low)
-                    fields["max_pair_index"] = min(
-                        fields["max_pair_index"] or max_pair, high)
+                    fields["min_pair_index"] = max(fields["min_pair_index"] or 1, low)
+                    fields["max_pair_index"] = min(fields["max_pair_index"] or max_pair, high)
                 continue
 
             if clause["kind"] == "day_part":
@@ -1621,7 +1364,7 @@ class Importer:
         segment_default = bool(polarity)
         fields, reasons = self._parse_wish_fields(text, segment_default)
         any_positive = fields.pop("_any_positive", False)
-        soft = bool(self.wish_soft_pattern.search(text)) or any_positive \
+        soft = bool(Entities.wish_soft_pattern.search(text)) or any_positive \
             or polarity is not True
         has_fields = bool(fields["forbidden_days"] or fields["forbidden_slot_ids"]
                           or fields["min_pair_index"] or fields["max_pair_index"]
@@ -1665,7 +1408,7 @@ class Importer:
             rules: list[dict] = []
             unmanaged: list[dict] = []
             if raw:
-                for segment in self.wish_segment_pattern.split(raw):
+                for segment in Entities.wish_segment_pattern.split(raw):
                     segment = re.sub(r"\s+", " ", segment).strip(" .;,")
                     if not segment:
                         continue
@@ -1688,12 +1431,12 @@ class Importer:
 
     def _build_course(self, row: pd.Series, lesson_type: str, hours: float,
                       sheet_name: str) -> dict:
-        group_ids = [x for x in re.split(r"[\s,;\n]+", str(row[self.group_column]).strip()) if x]
+        group_ids = [x for x in re.split(r"[\s,;\n]+", str(row[Entities.group_column]).strip()) if x]
         self._course_count += 1
         course_id = f"c{self._course_count}"
-        discipline = self._clean_discipline(row[self.discipline_column])
+        discipline = self._clean_discipline(row[Entities.discipline_column])
         name = f"{discipline} ({lesson_type})"
-        specs, teacher_meta = self._parse_teacher_cell(row.get(self.teacher_columns[lesson_type]))
+        specs, teacher_meta = self._parse_teacher_cell(row.get(Entities.teacher_columns[lesson_type]))
         if teacher_meta["unparsed"]:
             self._warnings.append(
                 f"Лист {sheet_name!r}, {course_id}: не удалось выделить ФИО "
@@ -1701,11 +1444,11 @@ class Importer:
         for fragment in teacher_meta["unresolved"]:
             self._warnings.append(
                 f"Лист {sheet_name!r}, {course_id}: неразобранный фрагмент ФИО {fragment!r}")
-        subgroups = self._parse_subgroup_counts(row.get(self.subgroup_column))
+        subgroups = self._parse_subgroup_counts(row.get(Entities.subgroup_column))
         if subgroups["unparsed"]:
             self._warnings.append(
                 f"Лист {sheet_name!r}, {course_id}: не удалось разобрать "
-                f"«{self.subgroup_column}»: {subgroups['raw']!r}")
+                f"«{Entities.subgroup_column}»: {subgroups['raw']!r}")
         if subgroups["ambiguous"]:
             self._warnings.append(
                 f"Лист {sheet_name!r}, {course_id}: неоднозначные подгруппы "
@@ -1721,11 +1464,11 @@ class Importer:
                 f"{subgroups['extra']!r}")
         column_count = self._subgroup_count_for_lesson(subgroups, lesson_type)
         requirements, software_raw = self._parse_requirements(row, lesson_type)
-        location = self._parse_location(row.get(self.location_column))
-        ntk_raw = self._text_cell(row.get(self.ntk_column))
-        delivery_raw = self._text_cell(row.get(self.delivery_model_column))
-        time_wish_raw = self._text_cell(row.get(self.time_wish_column))
-        comments_raw = self._text_cell(row.get(self.comments_column))
+        location = self._parse_location(row.get(Entities.location_column))
+        ntk_raw = self._text_cell(row.get(Entities.ntk_column))
+        delivery_raw = self._text_cell(row.get(Entities.delivery_model_column))
+        time_wish_raw = self._text_cell(row.get(Entities.time_wish_column))
+        comments_raw = self._text_cell(row.get(Entities.comments_column))
         venue_type = (
             "sport" if name in self.fixed_course_names else self._classify_venue(
                 ntk_raw, delivery_raw, location["location_raw"],
@@ -1992,17 +1735,17 @@ class Importer:
         requirements: list[str] = []
         software_raw = None
         if lesson_type == "лекция":
-            value = str(row.get(self.multimedia_column, "")).lower()
+            value = str(row.get(Entities.multimedia_column, "")).lower()
             if self._is_positive(value):
                 self._add_requirement(requirements, "multimedia_board")
             if "доск" in value:
                 self._add_board_requirement(value, requirements)
         else:
-            self._add_board_requirement(str(row.get(self.board_column, "")), requirements)
-            projector = row.get(self.projector_column)
+            self._add_board_requirement(str(row.get(Entities.board_column, "")), requirements)
+            projector = row.get(Entities.projector_column)
             if self._is_positive(projector):
                 self._add_requirement(requirements, "screen")
-            raw_software = row.get(self.software_column)
+            raw_software = row.get(Entities.software_column)
             if not pd.isna(raw_software):
                 text = re.sub(r"\s+", " ", str(raw_software).replace("\xa0", " ")).strip()
                 if text and text.lower() not in {"nan", "нет", "no", "-"}:
@@ -2014,7 +1757,7 @@ class Importer:
                         self._add_requirement(requirements, "computer_class")
                     if "интернет" in low:
                         self._add_requirement(requirements, "internet")
-        self._requirements_from_location(row.get(self.location_column), requirements)
+        self._requirements_from_location(row.get(Entities.location_column), requirements)
         return requirements, software_raw
 
     def _parse_location(self, raw_value: object) -> dict:
@@ -2029,7 +1772,7 @@ class Importer:
         result["location_raw"] = text
         allowed: list[str] = []
         unknown: list[str] = []
-        for match in self.room_ref_pattern.finditer(text):
+        for match in Entities.room_ref_pattern.finditer(text):
             room = self._normalize_room_id(match.group(0))
             if not room:
                 continue
@@ -2048,11 +1791,10 @@ class Importer:
             self._warn_once(
                 f"Место проведения {text!r}: аудитории {unknown!r} отсутствуют "
                 f"в справочнике; сохранён location_raw")
-        has_same_room = bool(self.same_room_pattern.search(text))
+        has_same_room = bool(Entities.same_room_pattern.search(text))
         if not allowed and not has_same_room and not unknown \
-                and not self.generic_location_pattern.search(text):
-            self._warn_once(
-                f"Место проведения {text!r} не распознано; сохранён location_raw")
+                and not Entities.generic_location_pattern.search(text):
+            self._warn_once(f"Место проведения {text!r} не распознано; сохранён location_raw")
         return result
 
     @staticmethod
@@ -2064,9 +1806,15 @@ class Importer:
             return None
         return text
 
-    def _classify_venue(self, ntk: str | None, delivery: str | None,
-                        location: str | None, comments: str | None,
-                        allowed_room_ids: list[str], course_id: str) -> str:
+    def _classify_venue(
+            self,
+            ntk: str | None,
+            delivery: str | None,
+            location: str | None,
+            comments: str | None,
+            allowed_room_ids: list[str],
+            course_id: str
+    ) -> str:
         """Return room/online/external/unspecified for one course row (п.9)."""
         ntk_key = self._name_key(ntk or "")
         delivery_key = self._name_key(delivery or "")
@@ -2077,24 +1825,24 @@ class Importer:
             return "online"
         if "исключительно эо" in delivery_key:
             return "online"
-        if location_key and self.venue_online_pattern.search(location_key) \
-                and not self.venue_room_pattern.search(location_key):
+        if location_key and Entities.venue_online_pattern.search(location_key) \
+                and not Entities.venue_room_pattern.search(location_key):
             return "online"
-        if location_key and self.venue_external_pattern.search(location_key) \
-                and not self.venue_campus_pattern.search(location_key):
+        if location_key and Entities.venue_external_pattern.search(location_key) \
+                and not Entities.venue_campus_pattern.search(location_key):
             return "external"
         if not location_key and comments_key \
-                and self.venue_comment_external_pattern.search(comments_key):
+                and Entities.venue_comment_external_pattern.search(comments_key):
             return "external"
         if allowed_room_ids:
             return "room"
-        if location_key and self.same_room_pattern.search(location_key):
+        if location_key and Entities.same_room_pattern.search(location_key):
             return "room"
-        if location_key and self.venue_room_pattern.search(location_key):
+        if location_key and Entities.venue_room_pattern.search(location_key):
             return "room"
-        if location_key and self.room_ref_pattern.search(location_key):
+        if location_key and Entities.room_ref_pattern.search(location_key):
             return "room"
-        if location_key and self.venue_no_room_pattern.search(location_key):
+        if location_key and Entities.venue_no_room_pattern.search(location_key):
             return "unspecified"
         if ntk_key.strip() == "нк":
             self._warn_once(
@@ -2136,32 +1884,34 @@ class Importer:
             return None
         return f"{year:04d}-{month:02d}-{day:02d}"
 
-    def _comment_duration_slots(self, text_key: str) -> float | None:
-        if self.comment_duration_half_pattern.search(text_key):
+    @staticmethod
+    def _comment_duration_slots(text_key: str) -> float | None:
+        if Entities.comment_duration_half_pattern.search(text_key):
             return 1.5
-        hours = self.comment_duration_hours_pattern.search(text_key)
+        hours = Entities.comment_duration_hours_pattern.search(text_key)
         if hours:
             value = float(hours.group(1).replace(",", "."))
             slots = value / 2
             if slots >= 1:
                 return slots
-        pairs = self.comment_duration_pairs_pattern.search(text_key)
+        pairs = Entities.comment_duration_pairs_pattern.search(text_key)
         if pairs:
             word = pairs.group(1)
-            return float(self.pair_count_word_values.get(word, 0) or word)
-        if self.comment_duration_double_pattern.search(text_key):
+            return float(Entities.pair_count_word_values.get(word, 0) or word)
+        if Entities.comment_duration_double_pattern.search(text_key):
             return 2.0
         return None
 
-    def _comment_week_ranges(self, text_key: str) -> list[list[int]]:
+    @staticmethod
+    def _comment_week_ranges(text_key: str) -> list[list[int]]:
         ranges: list[list[int]] = []
         if "недел" in text_key:
-            for start, end in self.comment_week_chain_pattern.findall(text_key):
+            for start, end in Entities.comment_week_chain_pattern.findall(text_key):
                 ranges.append([int(start), int(end)])
-        for pattern in self.comment_week_range_patterns:
+        for pattern in Entities.comment_week_range_patterns:
             for start, end in pattern.findall(text_key):
                 ranges.append([int(start), int(end)])
-        listed = self.comment_week_list_pattern.search(text_key)
+        listed = Entities.comment_week_list_pattern.search(text_key)
         if listed:
             for token in re.split(r"[,;]+|\bи\b", listed.group(1)):
                 token = token.strip()
@@ -2186,14 +1936,14 @@ class Importer:
         if not raw:
             return []
         hints: list[dict] = []
-        for segment in self.wish_segment_pattern.split(raw):
+        for segment in Entities.wish_segment_pattern.split(raw):
             text = re.sub(r"\s+", " ", segment).strip(" .;,")
             if not text:
                 continue
             text_key = self._name_key(text)
             hint = {
                 "scope": self._comment_scope(text_key),
-                "online": bool(self.comment_online_pattern.search(text_key)),
+                "online": bool(Entities.comment_online_pattern.search(text_key)),
                 "duration_slots": self._comment_duration_slots(text_key),
                 "period_start": None,
                 "period_end": None,
@@ -2201,11 +1951,11 @@ class Importer:
                 "semester_half": None,
                 "source": text,
             }
-            period = self.comment_period_pattern.search(text_key)
+            period = Entities.comment_period_pattern.search(text_key)
             if period:
                 hint["period_start"] = self._iso_date(period.group(1))
                 hint["period_end"] = self._iso_date(period.group(2))
-            half = self.comment_semester_half_pattern.search(text_key)
+            half = Entities.comment_semester_half_pattern.search(text_key)
             if half:
                 hint["semester_half"] = 1 if half.group(1) == "перв" else 2
             if not any((hint["online"], hint["duration_slots"] is not None,
@@ -2232,8 +1982,9 @@ class Importer:
         return [dict(hint) for hint in hints
                 if hint["scope"] == "all" or hint["scope"] == lesson_type]
 
-    def _warn_comment_venue_conflict(self, course_id: str, lesson_type: str,
-                                     venue_type: str, hints: list[dict]) -> None:
+    def _warn_comment_venue_conflict(
+            self, course_id: str, lesson_type: str, venue_type: str, hints: list[dict]
+    ) -> None:
         if venue_type == "online":
             return
         for hint in hints:
@@ -2242,8 +1993,7 @@ class Importer:
                     f"venue_conflict: курс {course_id}: комментарий говорит об "
                     f"онлайн-формате, но venue_type={venue_type}")
 
-    def _register_teachers_and_groups(self, course: dict, counts: list[int] | None,
-                                      sheet_name: str) -> None:
+    def _register_teachers_and_groups(self, course: dict, counts: list[int] | None, sheet_name: str) -> None:
         teacher_ids = list(course.get("teacher_ids") or [])
         for instance in course.get("instances") or []:
             teacher_ids.extend(instance.get("teacher_ids") or [])
@@ -2265,7 +2015,7 @@ class Importer:
                 sheet_name = self._group_size_sources.get(group_id)
                 where = f" (лист {sheet_name!r})" if sheet_name else ""
                 self._warnings.append(
-                    f"Группа {group_id}: не удалось определить «{self.students_column}»{where}; "
+                    f"Группа {group_id}: не удалось определить «{Entities.students_column}»{where}; "
                     f"использован default_group_size={self.default_group_size}")
             group["size"] = size
 
@@ -2396,8 +2146,7 @@ class Importer:
         return {"course_id": None, "course_ids": [], "instance_ids": [],
                 "match_type": "none"}
 
-    def _link_desires_to_courses(self, courses: list[dict], impossible: list[dict],
-                                 wanted: list[dict]) -> None:
+    def _link_desires_to_courses(self, courses: list[dict], impossible: list[dict], wanted: list[dict]) -> None:
         index: dict[tuple[str, str], list[dict]] = {}
         for course in courses:
             discipline = course.get("discipline") or self._course_label(course)
@@ -2426,7 +2175,7 @@ class Importer:
             if course.get("lesson_type") == "лекция":
                 continue
             raw = course.get("location_raw")
-            if not raw or not self.same_room_pattern.search(str(raw)):
+            if not raw or not Entities.same_room_pattern.search(str(raw)):
                 continue
             discipline = course.get("discipline") or self._course_label(course)
             discipline_key = self._normalize_discipline(discipline)
@@ -2530,7 +2279,7 @@ class Importer:
                 if pd.isna(value) or str(value).strip().lower() in {"", "false", "нет"}:
                     continue
                 label = str(column).split(" / ")[-1]
-                code = self.room_requirement_labels.get(self._name_key(label))
+                code = Entities.room_requirement_labels.get(self._name_key(label))
                 if code is None:
                     code = self._name_key(label)
                     self._warnings.append(
@@ -2692,9 +2441,7 @@ class Importer:
                           "timeslots_ids": list(slot_ids)})
         return fixed
 
-    def _build_fixed_schedule_events(
-        self, courses: list[dict], fixed: list[dict]
-    ) -> list[dict]:
+    def _build_fixed_schedule_events(self, courses: list[dict], fixed: list[dict]) -> list[dict]:
         """Materialize imported PE slots as displayable, group-blocking events."""
         courses_by_id = {course["id"]: course for course in courses}
         events = []
@@ -2768,8 +2515,7 @@ class Importer:
                 f"({len(groups_for_year)} учебных групп)"
             )
 
-    def _validate_fixed_schedules(self, courses: list[dict],
-                                  fixed: list[dict]) -> None:
+    def _validate_fixed_schedules(self, courses: list[dict], fixed: list[dict]) -> None:
         """Fail before the solver if the time grid or fixed slots are inconsistent."""
         known: dict[int, dict] = {}
         grid: set[tuple[str, int]] = set()
@@ -2851,62 +2597,3 @@ class Importer:
         if extra:
             raise ParserValidationError(
                 f"fixed_schedules: лишние записи для курсов {extra!r}")
-
-
-def build_arg_parser() -> argparse.ArgumentParser:
-    """Describe the parser CLI. Defaults point at parser/tables, not the cwd."""
-    data_dir = Path(__file__).resolve().parent / "tables"
-    parser = argparse.ArgumentParser(
-        prog="python -m parser.importer",
-        description="Собрать JSON для солвера из Excel-файлов нагрузки, аудиторий и анкеты.")
-    parser.add_argument(
-        "--courses", dest="courses_file", type=Path, default=data_dir / "table.xlsx",
-        help="Excel с нагрузкой (по умолчанию parser/tables/table.xlsx)")
-    parser.add_argument(
-        "--rooms", "--reference", dest="rooms_file", type=Path,
-        default=data_dir / "table2.xlsx",
-        help="Excel с каталогом аудиторий, сеткой слотов и эталонной занятостью "
-             "(по умолчанию parser/tables/table2.xlsx)")
-    parser.add_argument(
-        "--desires", dest="desires_file", type=Path,
-        default=data_dir / "table3.xlsx",
-        help="Excel с анкетой преподавателей (по умолчанию parser/tables/table3.xlsx)")
-    parser.add_argument(
-        "--config", dest="config_file", type=Path, default=None,
-        help="JSON-конфиг парсера (по умолчанию parser/config.json)")
-    parser.add_argument(
-        "--save", dest="save_path", type=Path,
-        default=Path(__file__).resolve().parent / "data.json",
-        help="Куда сохранить итоговый JSON (по умолчанию parser/data.json)")
-    parser.add_argument(
-        "--parse-room-occupancy", action="store_true",
-        help="Читать эталонную занятость из листа «Аудитории» в room_preblocked")
-    parser.add_argument(
-        "--rooms-sheet", default=Importer.rooms_sheet,
-        help=f"Имя листа аудиторий (по умолчанию {Importer.rooms_sheet!r})")
-    parser.add_argument(
-        "--pe-sheet", default=Importer.pe_sheet,
-        help=f"Имя листа физкультуры (по умолчанию {Importer.pe_sheet!r})")
-    return parser
-
-
-def run(*args, **kwargs) -> None:
-    if args or kwargs:
-        importer = Importer(*args, **kwargs)
-    else:
-        options = build_arg_parser().parse_args()
-        importer = Importer(
-            rooms_file=options.rooms_file,
-            rooms_sheet=options.rooms_sheet,
-            courses_file=options.courses_file,
-            desires_file=options.desires_file,
-            save_path=options.save_path,
-            config=options.config_file,
-            parse_room_occupancy=options.parse_room_occupancy,
-            pe_sheet=options.pe_sheet,
-        )
-    importer.save_to_json(importer.parse_from_excel())
-
-
-if __name__ == "__main__":
-    run()
