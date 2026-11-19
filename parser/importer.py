@@ -348,6 +348,7 @@ class Importer:
         self._time_slots = self._parse_time_slots(rooms_df)
         room_preblocked = self._parse_room_occupancy(rooms_df, rooms)
         courses, session_requests = self._parse_courses()
+        self._expand_whole_cohort_pe_groups(courses)
         impossible, wanted = ([], [])
         if self.desires_file is not None:
             desires_df = pd.read_excel(self.desires_file)
@@ -364,6 +365,7 @@ class Importer:
         self._finalize_time_wishes(courses)
         self._resolve_same_room_links(courses)
         self._finalize_course_instances(courses)
+        fixed_events = self._build_fixed_schedule_events(courses, fixed)
         return {
             "rooms": rooms,
             "teachers": list(self._teachers.values()),
@@ -373,6 +375,7 @@ class Importer:
             "teachers_impossible_slots": impossible,
             "teachers_wanted_slots": wanted,
             "fixed_schedules": fixed,
+            "fixed_schedule_events": fixed_events,
             "room_preblocked": room_preblocked,
             "ignored": {"session_requests": session_requests},
             "warnings": self._warnings,
@@ -1723,9 +1726,17 @@ class Importer:
         delivery_raw = self._text_cell(row.get(self.delivery_model_column))
         time_wish_raw = self._text_cell(row.get(self.time_wish_column))
         comments_raw = self._text_cell(row.get(self.comments_column))
-        venue_type = self._classify_venue(
-            ntk_raw, delivery_raw, location["location_raw"],
-            comments_raw, location["allowed_room_ids"], course_id)
+        venue_type = (
+            "sport" if name in self.fixed_course_names else self._classify_venue(
+                ntk_raw, delivery_raw, location["location_raw"],
+                comments_raw, location["allowed_room_ids"], course_id
+            )
+        )
+        # A PE course uses its preassigned sport slots and does not consume an
+        # IENIM classroom or classroom equipment from the regular room catalog.
+        if venue_type == "sport":
+            requirements = []
+            software_raw = None
         comment_hints = self._parse_comments_hints(comments_raw)
         instance_hints = self._filter_comment_hints(comment_hints, lesson_type)
         self._warn_comment_venue_conflict(
@@ -2284,6 +2295,19 @@ class Importer:
             problems.append("нет instances")
         if len(instances) != subgroup_count:
             problems.append("количество instances не совпадает с subgroup_count")
+        if (
+            subgroup_count > 1
+            and course.get("group_ids")
+            and all(
+                set(instance.get("group_ids") or []) == set(course["group_ids"])
+                for instance in instances
+            )
+        ):
+            self._warnings.append(
+                f"Курс {course['id']}: состав групп по подгруппам не задан; "
+                "каждый instance резервирует все group_ids курса. "
+                "Для параллельного расписания нужна привязка подгрупп к группам."
+            )
         indices = [instance.get("subgroup_index") for instance in instances]
         if sorted(indices) != list(range(1, len(instances) + 1)):
             problems.append(f"некорректные subgroup_index: {indices!r}")
@@ -2667,6 +2691,82 @@ class Importer:
             fixed.append({"course_id": course["id"],
                           "timeslots_ids": list(slot_ids)})
         return fixed
+
+    def _build_fixed_schedule_events(
+        self, courses: list[dict], fixed: list[dict]
+    ) -> list[dict]:
+        """Materialize imported PE slots as displayable, group-blocking events."""
+        courses_by_id = {course["id"]: course for course in courses}
+        events = []
+        for fixed_entry in fixed:
+            course = courses_by_id[fixed_entry["course_id"]]
+            pattern = str(course.get("week_pattern") or "weekly").casefold()
+            if pattern == "odd":
+                weeks = list(range(1, 17, 2))
+            elif pattern == "even":
+                weeks = list(range(2, 17, 2))
+            else:
+                weeks = list(range(1, 17))
+            for slot_id in fixed_entry["timeslots_ids"]:
+                events.append({
+                    "course_id": course["id"],
+                    "course_name": self._course_label(course),
+                    "lesson_type": course["lesson_type"],
+                    "teacher_ids": list(course.get("teacher_ids") or []),
+                    "group_ids": list(course.get("group_ids") or []),
+                    "timeslots_ids": [int(slot_id)],
+                    "weeks": weeks,
+                    "duration_slots": 1,
+                    "venue_type": "sport",
+                    "room_id": "Спортзал",
+                    "is_preassigned": True,
+                })
+        return events
+
+    def _expand_whole_cohort_pe_groups(self, courses: list[dict]) -> None:
+        """Resolve the PE workbook's `все` marker to real groups in that year."""
+        pe_courses = [
+            course for course in courses
+            if self._course_label(course) in self.fixed_course_names
+            and any(self._normalize_group_key(group) in {"ВСЕ", "ALL"}
+                    for group in (course.get("group_ids") or []))
+        ]
+        for pe_course in pe_courses:
+            year = self._fixed_course_year(pe_course)
+            sentinels = [
+                group for group in (pe_course.get("group_ids") or [])
+                if self._normalize_group_key(group) in {"ВСЕ", "ALL"}
+            ]
+            groups_for_year: list[str] = []
+            for course in courses:
+                if course is pe_course or self._course_label(course) in self.fixed_course_names:
+                    continue
+                try:
+                    course_year = self._fixed_course_year(course)
+                except ParserValidationError:
+                    continue
+                if course_year == year:
+                    for group_id in course.get("group_ids") or []:
+                        if self._normalize_group_key(group_id) not in {"ВСЕ", "ALL"} \
+                                and group_id not in groups_for_year:
+                            groups_for_year.append(group_id)
+            if not groups_for_year:
+                self._warnings.append(
+                    f"Курс {pe_course['id']}: маркер группы «все» для физкультуры "
+                    f"не удалось раскрыть для {year} курса; проверьте список групп"
+                )
+                continue
+            pe_course["group_ids"] = groups_for_year
+            for instance in pe_course.get("instances") or []:
+                instance["group_ids"] = list(groups_for_year)
+            for sentinel in sentinels:
+                self._groups.pop(sentinel, None)
+                self._group_sizes.pop(sentinel, None)
+                self._group_size_sources.pop(sentinel, None)
+            self._warnings.append(
+                f"Курс {pe_course['id']}: физкультура закреплена за {year} курсом "
+                f"({len(groups_for_year)} учебных групп)"
+            )
 
     def _validate_fixed_schedules(self, courses: list[dict],
                                   fixed: list[dict]) -> None:

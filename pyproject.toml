@@ -2,13 +2,10 @@
 name = "IENIM-schedule-builder"
 version = "0.1.0"
 description = "Schedule builder for IENIM"
-authors = [
-    {  }
-]
 requires-python = ">=3.11"
 dependencies = [
     "numpy>=2.4.6",
     "openpyxl>=3.1.5",
-    "ortools>=9.15.6755",
+    "ortools>=9.10",
     "pandas>=3.1.1",
 ]
