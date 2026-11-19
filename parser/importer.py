@@ -574,8 +574,54 @@ class Importer:
                 if self.discipline_column not in df or self.group_column not in df:
                     raise ValueError(f"Лист {sheet_name!r}: отсутствует колонка дисциплины или группы")
                 df[self.discipline_column] = df[self.discipline_column].ffill()
+                if "Курс" in df:
+                    df["Курс"] = df["Курс"].ffill()
+                groups_by_year: dict[str, list[str]] = {}
+                for _, source_row in df.iterrows():
+                    cohort_key = self._course_cohort_key(source_row.get("Курс"))
+                    if cohort_key is None:
+                        continue
+                    raw_groups = source_row.get(self.group_column)
+                    group_ids = self._parse_group_ids(raw_groups)
+                    groups = groups_by_year.setdefault(cohort_key, [])
+                    for group_id in group_ids:
+                        if group_id not in groups:
+                            groups.append(group_id)
                 session_columns = self._session_columns(df) if session_enabled else {}
                 for _, row in df.dropna(subset=[self.group_column]).iterrows():
+                    raw_groups = row.get(self.group_column)
+                    group_markers = {
+                        self._normalize_group_key(group)
+                        for group in self._split_group_tokens(raw_groups)
+                    }
+                    if group_markers.intersection({"ВСЕ", "ALL"}):
+                        cohort_key = self._course_cohort_key(row.get("Курс"))
+                        expanded_groups = groups_by_year.get(cohort_key, []) \
+                            if cohort_key else []
+                        if not expanded_groups:
+                            self._warnings.append(
+                                f"Лист {sheet_name!r}: не удалось раскрыть группу «все» "
+                                f"для курса {row.get('Курс')!r}; строка пропущена"
+                            )
+                            continue
+                        row = row.copy()
+                        row[self.group_column] = "\n".join(expanded_groups)
+                    else:
+                        valid_groups = self._parse_group_ids(raw_groups)
+                        invalid_groups = [
+                            value for value in self._split_group_tokens(raw_groups)
+                            if self._normalize_group_key(value) not in {"ВСЕ", "ALL"}
+                            and not self._is_group_id(value)
+                        ]
+                        if invalid_groups:
+                            self._warnings.append(
+                                f"Лист {sheet_name!r}: из списка групп удалены "
+                                f"служебные значения {invalid_groups!r}"
+                            )
+                        if not valid_groups:
+                            continue
+                        row = row.copy()
+                        row[self.group_column] = "\n".join(valid_groups)
                     row_courses, session = self._parse_row(row, sheet_name, session_columns)
                     courses.extend(row_courses)
                     if session is None:
@@ -595,6 +641,46 @@ class Importer:
                     session_requests.append(session)
         self._flush_hours_warnings()
         return courses, session_requests
+
+    @staticmethod
+    def _course_year_value(raw_value: object) -> int | None:
+        if pd.isna(raw_value):
+            return None
+        try:
+            value = float(str(raw_value).strip())
+        except (TypeError, ValueError):
+            return None
+        return int(value) if value.is_integer() and 1 <= value <= 6 else None
+
+    @staticmethod
+    def _split_group_tokens(raw_value: object) -> list[str]:
+        if pd.isna(raw_value):
+            return []
+        return [value for value in re.split(r"[\s,;\n]+", str(raw_value).strip()) if value]
+
+    @staticmethod
+    def _is_group_id(value: str) -> bool:
+        return bool(re.fullmatch(r"[A-Za-zА-Яа-яЁё]{2,10}-\d{4,6}", value))
+
+    @classmethod
+    def _parse_group_ids(cls, raw_value: object) -> list[str]:
+        return [
+            value for value in cls._split_group_tokens(raw_value)
+            if cls._is_group_id(value)
+        ]
+
+    @staticmethod
+    def _course_cohort_key(raw_value: object) -> str | None:
+        if pd.isna(raw_value):
+            return None
+        text = re.sub(r"\s+", "", str(raw_value)).casefold().replace("ё", "е")
+        if not text or text == "nan":
+            return None
+        try:
+            value = float(text)
+        except ValueError:
+            return text
+        return str(int(value)) if value.is_integer() else text
 
     def _parse_row(self, row: pd.Series, sheet_name: str,
                    session_columns: dict | None = None) -> tuple[list[dict], dict | None]:
@@ -1788,6 +1874,12 @@ class Importer:
                 "subgroup_column_count": column_count,
                 "subgroup_raw": subgroups["raw"],
                 "instances": instances,
+                "source_sheet": sheet_name,
+                "elective_group": (
+                    "course_sheet_electives"
+                    if "по выбору" in str(sheet_name).casefold()
+                    else None
+                ),
                 "_course_number": row.get("Курс")}
 
     def _build_course_instances(self, course_id: str, name: str, lesson_type: str,

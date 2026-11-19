@@ -123,6 +123,8 @@ def _session_text(row: dict, semester_weeks: int, continuation: bool = False) ->
         parts.append(weeks)
     if row.get("is_preassigned"):
         parts.append("закреплено")
+    if row.get("elective_group"):
+        parts.append("электив — вариант по выбору")
     return "\n".join(parts)
 
 
@@ -284,14 +286,17 @@ def export_result(result: dict, output_path: str | Path, source_data: dict | Non
         str(course.get("id")): {
             "course_name": course.get("discipline"),
             "lesson_type": course.get("lesson_type"),
+            "elective_group": course.get("elective_group"),
         }
         for course in (source_data.get("courses") or [])
     }
     schedule = [{**course_labels.get(str(row.get("course_id")), {}), **row} for row in schedule]
-    scheduled_groups = {str(group_id) for row in schedule for group_id in (row.get("group_ids") or [])}
+    source_groups = list(source_data.get("groups") or [])
+    source_group_ids = {str(group.get("id")) for group in source_groups}
     for event in result.get("reserved_events") or []:
         event_groups = [str(group_id) for group_id in (event.get("group_ids") or [])]
-        visible = [group_id for group_id in event_groups if not scheduled_groups or group_id in scheduled_groups]
+        visible = [group_id for group_id in event_groups
+                   if not source_group_ids or group_id in source_group_ids]
         if visible:
             schedule.append({**course_labels.get(str(event.get("course_id")), {}), **event, "group_ids": visible})
 
@@ -304,11 +309,9 @@ def export_result(result: dict, output_path: str | Path, source_data: dict | Non
                                                   "slot_index": row.get("slot_index_start"), "time": row.get("time")})
         time_slots = list(unique.values())
 
-    included = {str(group_id) for row in schedule for group_id in (row.get("group_ids") or [])}
-    for item in result.get("unplaced") or []:
-        included.update(str(group_id) for group_id in item.get("group_ids") or [])
-    source_groups = list(source_data.get("groups") or [])
-    group_ids = [str(group["id"]) for group in source_groups if str(group.get("id")) in included]
+    # This is an institute-wide grid: keep every input group visible, including
+    # groups whose only event is a reserved PE slot or whose lessons are unplaced.
+    group_ids = [str(group["id"]) for group in source_groups]
     known = set(group_ids)
     for row in schedule:
         for group_id in row.get("group_ids") or []:

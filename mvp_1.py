@@ -1,6 +1,8 @@
 import json
 import math
 import argparse
+import os
+import sys
 from collections import defaultdict
 from pathlib import Path
 
@@ -21,6 +23,8 @@ DEFAULT_CONFIG = {
     "max_estimated_vars": 200_000,
     # после feasibility оставить не больше N аудиторий (0 = без лимита)
     "max_candidate_rooms": 24,
+    # after room assignment, retry dropped instances at different starts
+    "room_repair_rounds": 2,
     # если two_phase phase2 не сошёлся — fallback на monolithic с остатком времени
     "repair_on_two_phase_fail": True,
     # доля времени на phase1 в two_phase (остальное phase2 / repair)
@@ -1077,15 +1081,18 @@ def add_group_gap_objective_terms(
     if weight <= 0:
         return []
 
+    vars_by_instance_start: dict[tuple[str, int], list] = defaultdict(list)
+    for key, var in x.items():
+        if len(key) == 3:
+            instance_id, start_id, _room_id = key
+            vars_by_instance_start[(instance_id, start_id)].append(var)
+
     def covering_vars(inst: dict, slot_id: int) -> list:
         duration = int(inst.get("duration_slots") or 1)
         covering = covering_by_duration.get(duration) or {}
         found = []
         for start_id in covering.get(slot_id, []):
-            for room in rooms:
-                key = (inst["instance_id"], start_id, room["id"])
-                if key in x:
-                    found.append(x[key])
+            found.extend(vars_by_instance_start.get((inst["instance_id"], start_id), []))
         return found
 
     slots_by_day: dict[str, list[dict]] = {}
@@ -1383,6 +1390,29 @@ def add_weekly_resource_limit(
     for variables in vars_by_week.values():
         if len(variables) > capacity:
             model.Add(sum(variables) <= capacity)
+
+
+def add_week_pattern_conflicts(
+    model: cp_model.CpModel,
+    var_groups: list[tuple[list, set[int]]],
+) -> None:
+    """Add exact resource conflicts grouped by identical week patterns.
+
+    A per-week expansion repeats large, almost identical constraints up to 16
+    times. Grouping by week signature preserves alternating-week semantics and
+    usually cuts those constraints down to one per distinct pattern pair.
+    """
+    by_pattern: dict[frozenset[int], list] = defaultdict(list)
+    for variables, weeks in var_groups:
+        if variables:
+            by_pattern[frozenset(int(week) for week in weeks)].extend(variables)
+    patterns = list(by_pattern.items())
+    for i, (weeks_i, vars_i) in enumerate(patterns):
+        if len(vars_i) > 1:
+            model.AddAtMostOne(vars_i)
+        for weeks_j, vars_j in patterns[i + 1:]:
+            if weeks_i.intersection(weeks_j):
+                model.Add(sum(vars_i) + sum(vars_j) <= 1)
 
 
 def resolve_course_display_name(course: dict, source: dict | None = None) -> str:
@@ -1771,6 +1801,8 @@ def expand_course_instances(
                     "teaching_mode": unit_mode,
                     "lesson_kind": lesson_kind,
                     "group_ids": group_ids,
+                    "elective_group": course.get("elective_group"),
+                    "source_sheet": course.get("source_sheet"),
                     "total_students": total_students,
                     "students_needed": total_students,
                     "requirements": requirements,
@@ -3038,6 +3070,16 @@ def solve_two_phase(
     weight_preferred_capacity = int(solver_config["weight_preferred_capacity"])
     weight_preferred_room_type = int(solver_config["weight_preferred_room_type"])
     workers = int(solver_config["num_search_workers"])
+    allow_partial = str(solver_config.get("unplaceable_instance_policy") or "strict").casefold() == "warn"
+    phase1_no_domain: list[dict] = []
+    blocked_start_ids = solver_config.get("_blocked_start_ids_by_instance") or {}
+    hint_start_ids = solver_config.get("_hint_start_ids_by_instance") or {}
+    profile_started = time_module.perf_counter()
+
+    def profile(message: str) -> None:
+        if os.environ.get("SCHEDULE_PROFILE"):
+            elapsed = time_module.perf_counter() - profile_started
+            print(f"[schedule-profile +{elapsed:.1f}s] {message}", file=sys.stderr, flush=True)
 
     # --- Phase 1: starts only ---
     model1 = cp_model.CpModel()
@@ -3048,6 +3090,7 @@ def solve_two_phase(
     for inst in course_instances:
         pref = wanted_prefs_by_instance[inst["instance_id"]]
         blocked = set(forbidden_slots_by_instance.get(inst["instance_id"], set()))
+        blocked_starts = set(blocked_start_ids.get(inst["instance_id"], []))
         allowed_slot_ids = None
         if inst["course_id"] in fixed_slots_by_course:
             allowed_slot_ids = set(fixed_slots_by_course[inst["course_id"]])
@@ -3059,6 +3102,8 @@ def solve_two_phase(
         phase1_rooms[inst["instance_id"]] = placeholder
 
         for start_id, block in start_blocks.items():
+            if start_id in blocked_starts:
+                continue
             block_ids = [slot["id"] for slot in block]
             if any(slot_id in blocked for slot_id in block_ids):
                 continue
@@ -3088,6 +3133,9 @@ def solve_two_phase(
             if (inst["instance_id"], start_id) in y
         ]
         if not possible:
+            if allow_partial:
+                phase1_no_domain.append(inst)
+                continue
             return json.dumps(
                 failure_payload(
                     status="ERROR",
@@ -3111,7 +3159,11 @@ def solve_two_phase(
                 ensure_ascii=False,
                 indent=2,
             )
-        model1.AddExactlyOne(possible)
+        if allow_partial:
+            model1.AddAtMostOne(possible)
+        else:
+            model1.AddExactlyOne(possible)
+    profile(f"phase 1 domains built: {len(y):,} slot variables")
 
     # Fixed schedules coverage in phase1
     for course_id, slot_ids in fixed_slots_by_course.items():
@@ -3137,6 +3189,7 @@ def solve_two_phase(
                 var = y.get((inst["instance_id"], start_id))
                 if var is not None:
                     phase1_covering[(inst["instance_id"], slot_id)].append(var)
+    profile(f"phase 1 slot index built: {len(phase1_covering):,} instance-slot entries")
 
     instances_by_teacher: dict[str, list[dict]] = defaultdict(list)
     instances_by_group: dict[str, list[dict]] = defaultdict(list)
@@ -3155,16 +3208,72 @@ def solve_two_phase(
                 if phase1_covering.get((inst["instance_id"], slot_id))
             ]
             if len(var_groups) > 1:
-                add_weekly_resource_limit(model1, var_groups)
+                add_week_pattern_conflicts(model1, var_groups)
 
-        for resource_instances in instances_by_group.values():
-            var_groups = [
-                (phase1_covering[(inst["instance_id"], slot_id)], instance_weeks(inst))
-                for inst in resource_instances
-                if phase1_covering.get((inst["instance_id"], slot_id))
-            ]
-            if len(var_groups) > 1:
-                add_weekly_resource_limit(model1, var_groups)
+        for group_id, resource_instances in instances_by_group.items():
+            # Sibling subgroup instances are disjoint student subsets of the
+            # same course. They may run in parallel, while any other course
+            # for this academic group must conflict with their combined
+            # occupancy. Represent siblings with one OR occupancy literal.
+            by_course_pattern: dict[tuple[str, frozenset[int]], list] = defaultdict(list)
+            counts_by_course_pattern: dict[tuple[str, frozenset[int]], int] = defaultdict(int)
+            course_meta: dict[tuple[str, frozenset[int]], dict] = {}
+            for inst in resource_instances:
+                variables = phase1_covering.get((inst["instance_id"], slot_id))
+                if not variables:
+                    continue
+                pattern = instance_weeks(inst)
+                key = (str(inst["course_id"]), pattern)
+                by_course_pattern[key].extend(variables)
+                counts_by_course_pattern[key] += 1
+                course_meta[key] = inst
+
+            mandatory_by_pattern: dict[frozenset[int], list] = defaultdict(list)
+            elective_by_pattern: dict[frozenset[int], list] = defaultdict(list)
+            for (course_id, pattern), variables in by_course_pattern.items():
+                if counts_by_course_pattern[(course_id, pattern)] > 1:
+                    occupied = model1.NewBoolVar(
+                        f"group_occ_g{group_id}_c{course_id}_s{slot_id}_w{len(pattern)}"
+                    )
+                    model1.AddMaxEquality(occupied, variables)
+                    variables = [occupied]
+                if course_meta[(course_id, pattern)].get("elective_group"):
+                    elective_by_pattern[pattern].extend(variables)
+                else:
+                    mandatory_by_pattern[pattern].extend(variables)
+
+            # Alternative courses from an elective sheet may overlap each
+            # other, but no elective may overlap a required course for the
+            # same group. Collapse weeks with the same active week-patterns.
+            all_patterns = set(mandatory_by_pattern) | set(elective_by_pattern)
+            by_week_profile: dict[tuple[tuple[frozenset[int], ...], tuple[frozenset[int], ...]], list[int]] = defaultdict(list)
+            for week in sorted({week for pattern in all_patterns for week in pattern}):
+                active_mandatory = tuple(sorted(
+                    (pattern for pattern in mandatory_by_pattern if week in pattern),
+                    key=lambda value: tuple(sorted(value)),
+                ))
+                active_electives = tuple(sorted(
+                    (pattern for pattern in elective_by_pattern if week in pattern),
+                    key=lambda value: tuple(sorted(value)),
+                ))
+                if active_mandatory or active_electives:
+                    by_week_profile[(active_mandatory, active_electives)].append(week)
+            for profile_index, ((mandatory_patterns, elective_patterns), _weeks) in enumerate(by_week_profile.items()):
+                mandatory_vars = [
+                    var for pattern in mandatory_patterns for var in mandatory_by_pattern[pattern]
+                ]
+                elective_vars = [
+                    var for pattern in elective_patterns for var in elective_by_pattern[pattern]
+                ]
+                if len(mandatory_vars) > 1:
+                    model1.AddAtMostOne(mandatory_vars)
+                if mandatory_vars and elective_vars:
+                    elective_occupied = model1.NewBoolVar(
+                        f"group_elective_occ_g{group_id}_s{slot_id}_p{profile_index}"
+                    )
+                    model1.AddMaxEquality(elective_occupied, elective_vars)
+                    model1.Add(sum(mandatory_vars) + elective_occupied <= 1)
+    profile("phase 1 teacher/group conflict constraints built")
 
     # Packing: физ. занятия в слоте ≤ число физ. аудиторий
     physical_room_n = len([room for room in rooms if not room.get("is_virtual")])
@@ -3179,6 +3288,7 @@ def solve_two_phase(
                     pack_groups.append((variables, instance_weeks(inst)))
             if pack_groups:
                 add_weekly_resource_limit(model1, pack_groups, capacity=physical_room_n)
+    profile("phase 1 room-capacity constraints built")
 
     # Gap soft on phase1 via synthetic x mapping
     # Reuse gap helper by adapting: build fake x from y
@@ -3186,20 +3296,35 @@ def solve_two_phase(
     for (inst_id, start_id), var in y.items():
         room_id = phase1_rooms[inst_id]["id"]
         x_gap[(inst_id, start_id, room_id)] = var
-    gap_rooms = list(phase1_rooms.values())
-    obj1.extend(
-        add_group_gap_objective_terms(
-            model1,
-            x_gap,
-            course_instances=course_instances,
-            time_slots=time_slots,
-            rooms=gap_rooms,
-            covering_by_duration=covering_by_duration,
-            weight=weight_group_gap,
+    if allow_partial:
+        # Prefer placing the maximum number of instances; soft preferences are
+        # optimized only in strict all-or-nothing mode for now.
+        model1.Maximize(sum(y.values()))
+        profile("phase 1 objective: maximize placed instances")
+    else:
+        gap_rooms = list(phase1_rooms.values())
+        profile("phase 1 gap objective build starting")
+        obj1.extend(
+            add_group_gap_objective_terms(
+                model1,
+                x_gap,
+                course_instances=course_instances,
+                time_slots=time_slots,
+                rooms=gap_rooms,
+                covering_by_duration=covering_by_duration,
+                weight=weight_group_gap,
+            )
         )
-    )
-    if obj1:
-        model1.Maximize(sum(obj1))
+        profile(f"phase 1 gap objective built: {len(obj1):,} objective terms")
+        if obj1:
+            model1.Maximize(sum(obj1))
+    if hint_start_ids:
+        for (instance_id, start_id), variable in y.items():
+            hinted_start = hint_start_ids.get(instance_id)
+            if hinted_start is not None:
+                model1.AddHint(variable, int(int(hinted_start) == start_id))
+        profile(f"phase 1 warm start added: {len(hint_start_ids):,} retained starts")
+    profile(f"phase 1 model built: {len(course_instances):,} instances; starting CP-SAT")
 
     solver1 = cp_model.CpSolver()
     solver1.parameters.max_time_in_seconds = t1_limit
@@ -3207,6 +3332,7 @@ def solve_two_phase(
     t0 = time_module.time()
     status1 = solver1.Solve(model1)
     phase1_time = round(time_module.time() - t0, 3)
+    profile(f"phase 1 search finished: {solver1.StatusName(status1)} in {phase1_time:.1f}s")
 
     if status1 not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
         timed_out1 = (
@@ -3258,14 +3384,22 @@ def solve_two_phase(
     for (inst_id, start_id), var in y.items():
         if solver1.Value(var) == 1:
             assigned_start[inst_id] = start_id
+    instance_by_id = {inst["instance_id"]: inst for inst in course_instances}
+    phase1_dropped = [
+        inst for inst in course_instances
+        if inst["instance_id"] not in assigned_start
+    ]
 
     # --- Phase 2: rooms for fixed starts ---
     model2 = cp_model.CpModel()
     z: dict[tuple[str, str], object] = {}
     obj2: list = []
     domain_by_inst: dict[str, list[dict]] = {}
+    phase2_no_domain: list[dict] = []
 
     for inst in course_instances:
+        if inst["instance_id"] not in assigned_start:
+            continue
         pref = wanted_prefs_by_instance[inst["instance_id"]]
         domain, err = _collect_instance_room_domain(
             inst,
@@ -3303,6 +3437,9 @@ def solve_two_phase(
                 continue
             candidates.append(room)
         if not candidates:
+            if allow_partial:
+                phase2_no_domain.append(inst)
+                continue
             return json.dumps(
                 failure_payload(
                     status="ERROR",
@@ -3349,11 +3486,17 @@ def solve_two_phase(
                     score -= weight_preferred_room_type
             if score:
                 obj2.append(score * var)
-        model2.AddExactlyOne(vars_room)
+        if allow_partial:
+            model2.AddAtMostOne(vars_room)
+        else:
+            model2.AddExactlyOne(vars_room)
+    profile(f"phase 2 domains built: {len(z):,} room variables")
 
     # Room conflicts on each occupied slot of the fixed blocks
     phase2_room_slot_groups: dict[tuple[str, int], list[tuple[list, set[int]]]] = defaultdict(list)
     for inst in course_instances:
+        if inst["instance_id"] not in assigned_start or inst["instance_id"] not in domain_by_inst:
+            continue
         start_id = assigned_start[inst["instance_id"]]
         duration = int(inst.get("duration_slots") or 1)
         block = (blocks_by_duration.get(duration) or {}).get(start_id) or []
@@ -3365,11 +3508,16 @@ def solve_two_phase(
                     phase2_room_slot_groups[(str(room["id"]), int(slot["id"]))].append(([z[key]], weeks))
     for var_groups in phase2_room_slot_groups.values():
         if len(var_groups) > 1:
-            add_weekly_resource_limit(model2, var_groups)
+            add_week_pattern_conflicts(model2, var_groups)
+    profile(f"phase 2 room conflict constraints built: {len(phase2_room_slot_groups):,} resource-slots")
 
     # same_room on phase2
     physical_rooms = [room for room in rooms if not room.get("is_virtual")]
     for group in same_room_groups:
+        if allow_partial:
+            group = [inst for inst in group if inst["instance_id"] in assigned_start]
+            if len(group) < 2:
+                continue
         used: dict[tuple[str, str], object | None] = {}
         for inst in group:
             for room in physical_rooms:
@@ -3377,6 +3525,19 @@ def solve_two_phase(
                 used[(inst["instance_id"], room["id"])] = z[key] if key in z else None
         anchor = group[0]["instance_id"]
         for inst in group[1:]:
+            if allow_partial:
+                left_presence = sum(
+                    z[(anchor, room["id"])]
+                    for room in domain_by_inst.get(anchor, [])
+                    if (anchor, room["id"]) in z
+                )
+                right_id = inst["instance_id"]
+                right_presence = sum(
+                    z[(right_id, room["id"])]
+                    for room in domain_by_inst.get(right_id, [])
+                    if (right_id, room["id"]) in z
+                )
+                model2.Add(left_presence == right_presence)
             for room in physical_rooms:
                 left = used[(anchor, room["id"])]
                 right = used[(inst["instance_id"], room["id"])]
@@ -3388,8 +3549,11 @@ def solve_two_phase(
                     model2.Add(left == 0)
                 else:
                     model2.Add(left == right)
+    profile("phase 2 model built; starting CP-SAT")
 
-    if obj2:
+    if allow_partial:
+        model2.Maximize(sum(z.values()))
+    elif obj2:
         model2.Maximize(sum(obj2))
 
     solver2 = cp_model.CpSolver()
@@ -3398,6 +3562,7 @@ def solve_two_phase(
     t1 = time_module.time()
     status2 = solver2.Solve(model2)
     phase2_time = round(time_module.time() - t1, 3)
+    profile(f"phase 2 search finished: {solver2.StatusName(status2)} in {phase2_time:.1f}s")
 
     if status2 not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
         timed_out2 = (
@@ -3447,19 +3612,21 @@ def solve_two_phase(
             indent=2,
         )
 
+    assigned_room: dict[str, dict] = {}
+    for (inst_id, room_id), var in z.items():
+        if solver2.Value(var) == 1:
+            assigned_room[inst_id] = next(
+                room for room in domain_by_inst[inst_id] if str(room["id"]) == str(room_id)
+            )
+
     schedule_result = []
     for inst in course_instances:
+        if inst["instance_id"] not in assigned_start or inst["instance_id"] not in assigned_room:
+            continue
         start_id = assigned_start[inst["instance_id"]]
         duration = int(inst.get("duration_slots") or 1)
         block = (blocks_by_duration.get(duration) or {})[start_id]
-        chosen_room = None
-        for room in domain_by_inst[inst["instance_id"]]:
-            key = (inst["instance_id"], room["id"])
-            if key in z and solver2.Value(z[key]) == 1:
-                chosen_room = room
-                break
-        if chosen_room is None:
-            continue
+        chosen_room = assigned_room[inst["instance_id"]]
         start_slot = block[0]
         end_slot = block[-1]
         start_time = str(start_slot.get("time") or "")
@@ -3496,6 +3663,8 @@ def solve_two_phase(
             "week_pattern": inst.get("week_pattern") or {"type": "all"},
             "weeks": sorted(instance_weeks(inst)),
         }
+        if inst.get("elective_group"):
+            row["elective_group"] = inst["elective_group"]
         if inst.get("allowed_room_ids") is not None:
             row["allowed_room_ids"] = list(inst["allowed_room_ids"])
         if inst.get("same_room_as_course_id"):
@@ -3518,9 +3687,42 @@ def solve_two_phase(
         wanted_prefs_by_instance=wanted_prefs_by_instance,
         solver_config=solver_config,
     )
-    all_warnings = list(solver_warnings) + soft_warnings
+    dropped_ids = {
+        inst["instance_id"] for inst in phase1_dropped + phase2_no_domain
+    }
+    dropped_ids.update(
+        inst["instance_id"] for inst in course_instances
+        if inst["instance_id"] in assigned_start
+        and inst["instance_id"] not in assigned_room
+    )
+    dropped_instances = [instance_by_id[instance_id] for instance_id in dropped_ids]
+    unplaced_warnings = [{
+        "code": "UNPLACEABLE_INSTANCE_DROPPED",
+        "message": (
+            f"Занятие '{inst['name']}' не удалось поставить при текущих ограничениях "
+            "группы, преподавателя, времени и аудиторий"
+        ),
+        "course_id": inst.get("course_id"),
+        "entity_ids": [inst["instance_id"]],
+        "instance_id": inst["instance_id"],
+        "name": inst.get("name"),
+        "group_ids": list(inst.get("group_ids") or []),
+        "elective_group": inst.get("elective_group"),
+        "cause_code": "NO_FEASIBLE_SLOT_OR_ROOM",
+    } for inst in dropped_instances]
+    all_warnings = list(solver_warnings) + soft_warnings + unplaced_warnings
+    if allow_partial and solver1.StatusName(status1) != "OPTIMAL":
+        all_warnings.append({
+            "code": "PLACEMENT_MAX_NOT_PROVEN",
+            "message": (
+                "Лимит времени истёк до доказательства максимального количества "
+                "размещённых занятий; при большем лимите часть непоставленных может встать"
+            ),
+            "placed_instances": len(assigned_start),
+            "best_objective_bound": solver1.BestObjectiveBound(),
+        })
     status_label = "SUCCESS_WITH_WARNINGS" if all_warnings else "SUCCESS"
-    return json.dumps({
+    result_payload = {
         "status": status_label,
         "errors": [],
         "warnings": all_warnings,
@@ -3543,11 +3745,81 @@ def solve_two_phase(
             "num_search_workers": workers,
             "variables_phase1": len(y),
             "variables_phase2": len(z),
+            "placed_instances": len(schedule_result),
+            "unplaced_instances": len(dropped_instances),
+            "phase1_placed_instances": len(assigned_start),
+            "phase1_solver_status": solver1.StatusName(status1),
+            "phase1_best_objective_bound": solver1.BestObjectiveBound(),
             "max_candidate_rooms": int(solver_config.get("max_candidate_rooms") or 0),
             "missing_teacher_policy": resolve_missing_teacher_policy(solver_config),
             "unmet_soft_count": len(soft_warnings),
         },
-    }, ensure_ascii=False, indent=2)
+    }
+
+    # Phase 1 uses a room-count relaxation. If room assignment drops courses,
+    # forbid those exact starts and re-run the slot phase so it can move them
+    # into slots with available rooms. Keep the best complete two-phase result.
+    repair_rounds_left = int(
+        solver_config.get("_room_repair_rounds", solver_config.get("room_repair_rounds", 0)) or 0
+    )
+    room_dropped_ids = {
+        inst["instance_id"] for inst in course_instances
+        if inst["instance_id"] in assigned_start
+        and inst["instance_id"] not in assigned_room
+    }
+    elapsed_total = time_module.perf_counter() - profile_started
+    repair_time = min(60.0, (total_limit - elapsed_total) / max(1, repair_rounds_left))
+    if (
+        allow_partial
+        and room_dropped_ids
+        and repair_rounds_left > 0
+        and repair_time >= 20.0
+    ):
+        new_blocked = {
+            str(instance_id): set(int(value) for value in values)
+            for instance_id, values in blocked_start_ids.items()
+        }
+        for instance_id in room_dropped_ids:
+            new_blocked.setdefault(instance_id, set()).add(int(assigned_start[instance_id]))
+        repair_config = {
+            **solver_config,
+            "max_time_in_seconds": repair_time,
+            "_room_repair_rounds": repair_rounds_left - 1,
+            "_hint_start_ids_by_instance": {
+                instance_id: start_id
+                for instance_id, start_id in assigned_start.items()
+                if instance_id not in room_dropped_ids
+            },
+            "_blocked_start_ids_by_instance": {
+                instance_id: sorted(values) for instance_id, values in new_blocked.items()
+            },
+        }
+        profile(
+            f"room repair: retrying {len(room_dropped_ids):,} instances at alternate starts "
+            f"({repair_rounds_left} rounds left, {repair_time:.1f}s)"
+        )
+        repaired = json.loads(solve_two_phase(
+            course_instances=course_instances,
+            rooms=rooms,
+            rooms_by_id=rooms_by_id,
+            time_slots=time_slots,
+            fixed_slots_by_course=fixed_slots_by_course,
+            forbidden_slots_by_instance=forbidden_slots_by_instance,
+            wanted_prefs_by_instance=wanted_prefs_by_instance,
+            blocks_by_duration=blocks_by_duration,
+            covering_by_duration=covering_by_duration,
+            same_room_groups=same_room_groups,
+            room_preblocked=room_preblocked,
+            solver_config=repair_config,
+            solver_warnings=solver_warnings,
+        ))
+        if len(repaired.get("schedule") or []) > len(schedule_result):
+            repaired.setdefault("meta", {})["room_repair_rounds_used"] = (
+                1 + int((repaired.get("meta") or {}).get("room_repair_rounds_used") or 0)
+            )
+            return json.dumps(repaired, ensure_ascii=False, indent=2)
+
+    return json.dumps(result_payload, ensure_ascii=False, indent=2)
 
 
 def solve_schedule(input_json_str: str, config: dict | None = None) -> str:
