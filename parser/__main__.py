@@ -2,27 +2,27 @@
 from pathlib import Path
 
 from parser.entities.table_entities import Entities
-from parser.importer import Importer
+from parser.importer.importer import Importer
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
-    """Describe the parser CLI. Defaults point at parser/tables, not the cwd."""
-    data_dir = Path(__file__).resolve().parent / "tables"
+    """Describe the parser CLI. Defaults point at the repository tables directory."""
+    data_dir = Entities.data_dir
     parser = argparse.ArgumentParser(
-        prog="python -m parser.importer",
+        prog="python -m parser",
         description="Собрать JSON для солвера из Excel-файлов нагрузки, аудиторий и анкеты.")
     parser.add_argument(
         "--courses", dest="courses_file", type=Path, default=data_dir / "table.xlsx",
-        help="Excel с нагрузкой (по умолчанию parser/tables/table.xlsx)")
+        help="Excel с нагрузкой (по умолчанию tables/table.xlsx)")
     parser.add_argument(
         "--rooms", "--reference", dest="rooms_file", type=Path,
         default=data_dir / "table2.xlsx",
         help="Excel с каталогом аудиторий, сеткой слотов и эталонной занятостью "
-             "(по умолчанию parser/tables/table2.xlsx)")
+             "(по умолчанию tables/table2.xlsx)")
     parser.add_argument(
         "--desires", dest="desires_file", type=Path,
         default=data_dir / "table3.xlsx",
-        help="Excel с анкетой преподавателей (по умолчанию parser/tables/table3.xlsx)")
+        help="Excel с анкетой преподавателей (по умолчанию tables/table3.xlsx)")
     parser.add_argument(
         "--config", dest="config_file", type=Path, default=None,
         help="JSON-конфиг парсера (по умолчанию parser/config.json)")

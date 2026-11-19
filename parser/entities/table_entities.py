@@ -3,7 +3,7 @@ from pathlib import Path
 
 
 class Entities:
-    data_dir = Path(__file__).resolve().parent.parent / "tables"
+    data_dir = Path(__file__).resolve().parent.parent.parent / "tables"
     config_file = Path(__file__).resolve().parent.parent / "config.json"
     rooms_file = data_dir / "table2.xlsx"
     rooms_sheet = "Аудитории"

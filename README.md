@@ -7,11 +7,11 @@
 ```powershell
 python -m venv .venv
 .\.venv\Scripts\python.exe -m pip install -e .
-.\.venv\Scripts\python.exe -m parser.importer
+.\.venv\Scripts\python.exe -m parser
 .\.venv\Scripts\python.exe mvp_1.py --scope c25,c26,c27,c38,c45
 ```
 
-Импортёр читает Excel из `parser/tables` и формирует `parser/data.json`. Физкультура из импортированной сетки передаётся решателю как закреплённые события. Для заранее занятой аудитории можно запустить импортёр с `--parse-room-occupancy`.
+Импортёр читает Excel из `tables` и формирует `parser/data.json`. Физкультура из импортированной сетки передаётся решателю как закреплённые события. Для заранее занятой аудитории можно запустить импортёр с `--parse-room-occupancy`.
 
 Решатель формирует `outputs/schedule.xlsx` и `outputs/result.json`. В Excel есть общая сетка на семестр, лист диагностики и лист непоставленных занятий. Частота недель указывается в занятии.
 

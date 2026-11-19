@@ -1,12 +1,12 @@
 # Схема `courses[].instances` (парсер → солвер)
 
-Документ фиксирует структуру данных, которую `parser/importer.py` формирует для солвера
+Документ фиксирует структуру данных, которую `parser/importer/importer.py` формирует для солвера
 после интеграции пунктов 3 (подгруппы/команды), 4 (несколько преподавателей в ячейке),
 5 (канонический `teacher_id`), 6 (связка анкеты), 7 (аудитории и требования),
 8 (место проведения), 9 (`venue_type`), 10 (пожелания по времени),
 11 (комментарии) и 12 (`fixed_schedules` для физкультуры).
 
-**Статус:** реализовано в `parser/importer.py` (`_parse_subgroup_counts`,
+**Статус:** реализовано в `parser/importer/importer.py` (`_parse_subgroup_counts`,
 `_parse_teacher_cell`, `_build_course_instances`, `_finalize_teacher_ids`,
 `_link_desires_to_courses`, `_parse_rooms`, `_parse_requirements`,
 `_parse_location`, `_resolve_same_room_links`, `_classify_venue`,
