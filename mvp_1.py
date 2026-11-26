@@ -24,15 +24,19 @@ DEFAULT_CONFIG = {
     # после feasibility оставить не больше N аудиторий (0 = без лимита)
     "max_candidate_rooms": 24,
     # after room assignment, retry dropped instances at different starts
-    "room_repair_rounds": 2,
+    "room_repair_rounds": 4,
     # если two_phase phase2 не сошёлся — fallback на monolithic с остатком времени
     "repair_on_two_phase_fail": True,
     # доля времени на phase1 в two_phase (остальное phase2 / repair)
-    "two_phase_time_fraction": 0.55,
+    "two_phase_time_fraction": 0.50,
     # soft weights for teachers_wanted_slots
     "weight_wanted_slot": 10,
     "weight_preferred_capacity": 1,
     "weight_preferred_room_type": 1,
+    # soft: предпочтение аудитории с экраном / proxy, если в requirements есть screen
+    "weight_preferred_screen": 3,
+    # hard-вместимость: students <= capacity * factor (1.2 = +20%)
+    "capacity_overbook_factor": 1.2,
     # вместимость, если парсер не дал students_needed
     "default_group_size": 30,
     # для lecture_stream при «дефолтных» size у всех групп потока
@@ -105,6 +109,27 @@ REQUIREMENT_FLAGS = {
     # any board is enough
     "board": ("has_board", "has_chalkboard", "has_whiteboard", "has_multimedia_board"),
 }
+
+# Не hard-kill в домене аудиторий: учитываются soft-штрафом / игнором.
+SOFT_EQUIPMENT_REQUIREMENTS = frozenset({"internet", "screen"})
+
+# Коды warnings для отчёта/UI: непостановка vs мягкие замечания.
+UNPLACED_WARNING_CODES = frozenset({
+    "UNPLACEABLE_INSTANCE_DROPPED",
+})
+SOFT_WARNING_CODES = frozenset({
+    "SCHEDULED_LATE_SLOT",
+    "SCHEDULED_ON_SATURDAY",
+    "UNMET_SOFT_TIME_WISH",
+    "UNMET_WANTED_SLOT",
+    "UNMANAGED_TIME_WISH",
+    "UNMET_SOFT_EQUIPMENT",
+    "MISSING_TEACHER_PLACEHOLDER",
+    "INFEASIBLE_FIXED_ROOM_IGNORED",
+    "PLACEMENT_MAX_NOT_PROVEN",
+    "FIXED_SCHEDULE_COUNT_MISMATCH",
+    "SCOPE_DROPPED_FIXED_SCHEDULES",
+})
 
 # labels from table3 / teachers_wanted_slots.room_requirements
 ROOM_REQUIREMENT_LABELS = {
@@ -243,9 +268,9 @@ def room_meets_requirements(room: dict, requirements: list[str] | None) -> bool:
             if not room_meets_software(room, True):
                 return False
             continue
-        if req == "internet":
-            if not any(bool(room.get(flag)) for flag in ("has_internet", "has_wifi")):
-                return False
+        if req in SOFT_EQUIPMENT_REQUIREMENTS:
+            # internet / screen — не hard-kill: мало флагов в каталоге;
+            # учитываются soft (см. soft_equipment_penalty / UNMET_SOFT_EQUIPMENT).
             continue
         flags = REQUIREMENT_FLAGS.get(req)
         if flags is None:
@@ -292,15 +317,66 @@ def room_capacity_value(room: dict) -> int | None:
         return None
 
 
+def resolve_capacity_overbook_factor(config: dict | None = None) -> float:
+    """Множитель hard-вместимости: students <= capacity * factor."""
+    raw = (config or DEFAULT_CONFIG).get(
+        "capacity_overbook_factor",
+        DEFAULT_CONFIG.get("capacity_overbook_factor", 1.2),
+    )
+    try:
+        factor = float(raw)
+    except (TypeError, ValueError):
+        return 1.2
+    if factor <= 0 or math.isnan(factor) or math.isinf(factor):
+        return 1.2
+    return factor
+
+
+def effective_room_capacity(
+    capacity: int,
+    *,
+    overbook_factor: float | None = None,
+) -> int:
+    """Допустимое число студентов: floor(capacity * factor), минимум capacity."""
+    factor = (
+        resolve_capacity_overbook_factor()
+        if overbook_factor is None
+        else float(overbook_factor)
+    )
+    if factor < 1.0:
+        factor = 1.0
+    return max(int(capacity), int(math.floor(capacity * factor)))
+
+
+def room_fits_students(
+    capacity: int | None,
+    total_students: int,
+    *,
+    overbook_factor: float | None = None,
+) -> bool:
+    """True, если students <= вместимость аудитории + overbook (по умолчанию +20%)."""
+    if capacity is None:
+        return False
+    return int(total_students) <= effective_room_capacity(
+        int(capacity),
+        overbook_factor=overbook_factor,
+    )
+
+
 def room_is_feasible(
     room: dict,
     *,
     total_students: int,
     requirements: list[str] | None = None,
     needs_software: object = None,
+    overbook_factor: float | None = None,
 ) -> bool:
     capacity = room_capacity_value(room)
-    if capacity is None or capacity < total_students:
+    if not room_fits_students(
+        capacity,
+        total_students,
+        overbook_factor=overbook_factor,
+    ):
         return False
     if not room_meets_requirements(room, requirements):
         return False
@@ -312,10 +388,65 @@ def room_is_feasible(
 def _missing_requirements_for_room(room: dict, requirements: list[str] | None) -> list[str]:
     missing = []
     for req in requirements or []:
+        if req in {"software"} | SOFT_EQUIPMENT_REQUIREMENTS:
+            continue
+        if req == "computer_class":
+            if not room_meets_software(room, True):
+                missing.append(req)
+            continue
         flags = REQUIREMENT_FLAGS.get(req)
         if flags is None or not _room_has_any_flag(room, flags):
             missing.append(req)
     return missing
+
+
+def room_satisfies_soft_equipment(room: dict, req: str) -> bool:
+    """Proxy-проверка soft-оснащения (не hard-домен)."""
+    if req == "internet":
+        if room.get("has_internet") or room.get("has_wifi"):
+            return True
+        # комп. класс часто подразумевает сеть
+        return room_meets_software(room, True)
+    if req == "screen":
+        if room.get("has_screen") or room.get("has_multimedia_board"):
+            return True
+        room_type = str(room.get("type") or room.get("kind") or "").casefold()
+        # «м» / мультимедиа / лекционные часто с проектором
+        return room_type in {"м", "м лаб"} or "лекц" in room_type or "мульти" in room_type
+    return True
+
+
+def soft_equipment_penalty(
+    room: dict,
+    requirements: list[str] | None,
+    *,
+    weight_screen: int = 0,
+) -> int:
+    """Штраф objective, если soft-требование не закрыто аудиторией."""
+    if room.get("is_virtual") or not requirements:
+        return 0
+    penalty = 0
+    if weight_screen and "screen" in requirements:
+        if not room_satisfies_soft_equipment(room, "screen"):
+            penalty += int(weight_screen)
+    return penalty
+
+
+def classify_warning_kind(warning: dict) -> str:
+    """unplaced | soft | other — для UI и листа диагностики."""
+    code = str(warning.get("code") or "")
+    if code in UNPLACED_WARNING_CODES:
+        return "unplaced"
+    if code in SOFT_WARNING_CODES:
+        return "soft"
+    return "other"
+
+
+def partition_warnings(warnings: list[dict] | None) -> dict[str, list[dict]]:
+    groups: dict[str, list[dict]] = {"unplaced": [], "soft": [], "other": []}
+    for warning in warnings or []:
+        groups[classify_warning_kind(warning)].append(warning)
+    return groups
 
 
 def normalize_course_name(value: object) -> str:
@@ -1670,8 +1801,12 @@ def expand_course_instances(
             venue_type = resolve_venue_type(course, source, fixed_entry)
             if source.get("needs_room") is not None:
                 needs_room_flag = source.get("needs_room")
+            elif source.get("needs_physical_room") is not None:
+                needs_room_flag = source.get("needs_physical_room")
             elif course.get("needs_room") is not None:
                 needs_room_flag = course.get("needs_room")
+            elif course.get("needs_physical_room") is not None:
+                needs_room_flag = course.get("needs_physical_room")
             elif fixed_entry is not None and fixed_entry.get("needs_room") is not None:
                 needs_room_flag = fixed_entry.get("needs_room")
             else:
@@ -2144,8 +2279,9 @@ def select_candidate_rooms(
 
     def sort_key(room: dict) -> tuple:
         capacity = int(room.get("capacity") or 0)
-        overflow = max(0, capacity - total_students)
-        under = max(0, total_students - capacity)  # уже отфильтровано, =0
+        allowed = effective_room_capacity(capacity)
+        overflow = max(0, allowed - total_students)
+        under = max(0, total_students - allowed)  # уже отфильтровано, =0
         return (under, overflow, capacity, str(room.get("id")))
 
     feasible.sort(key=sort_key)
@@ -2485,14 +2621,17 @@ def build_fixed_room_error(inst: dict, pref: dict, rooms_by_id: dict[str, dict])
         }
 
     requirements = list(inst.get("requirements") or [])
+    capacity = room_capacity_value(room)
+    effective = effective_room_capacity(capacity) if capacity is not None else None
     return {
         "status": "ERROR",
         "errors": [{
             "code": "FIXED_ROOM_INFEASIBLE",
             "message": (
                 f"Для курса '{inst['name']}' аудитория '{fixed_room}' недоступна "
-                f"(вместимость {room.get('capacity')}, нужно студентов "
-                f"{inst['total_students']}, требования {requirements or '—'})"
+                f"(вместимость {room.get('capacity')}, с запасом +20% → {effective}, "
+                f"нужно студентов {inst['total_students']}, "
+                f"требования {requirements or '—'})"
             ),
             "course_id": inst["course_id"],
             "entity_ids": [inst["instance_id"]],
@@ -2501,6 +2640,7 @@ def build_fixed_room_error(inst: dict, pref: dict, rooms_by_id: dict[str, dict])
             "requirements": requirements,
             "students_needed": inst["total_students"],
             "room_capacity": room.get("capacity"),
+            "effective_capacity": effective,
         }],
         "message": f"Фиксированная аудитория '{fixed_room}' не подходит для курса '{inst['name']}'",
     }
@@ -2556,7 +2696,7 @@ def build_no_room_error(inst: dict, rooms: list[dict]) -> dict:
     almost = []
     for room in rooms:
         capacity = room_capacity_value(room)
-        if capacity is None or capacity < inst["total_students"]:
+        if not room_fits_students(capacity, inst["total_students"]):
             continue
         capacity_ok.append(room["id"])
         missing = _missing_requirements_for_room(room, requirements)
@@ -2565,14 +2705,17 @@ def build_no_room_error(inst: dict, rooms: list[dict]) -> dict:
             almost.append({
                 "room_id": room["id"],
                 "capacity": room.get("capacity"),
+                "effective_capacity": effective_room_capacity(capacity) if capacity is not None else None,
                 "missing_requirements": missing,
                 "software_ok": soft_ok,
             })
 
     hint_parts = []
     if not capacity_ok:
+        factor = resolve_capacity_overbook_factor()
         hint_parts.append(
-            f"нет аудиторий вместимостью >= {inst['total_students']}"
+            f"нет аудиторий с эффективной вместимостью "
+            f"(capacity×{factor:g}) >= {inst['total_students']}"
         )
     elif almost:
         preview = ", ".join(
@@ -2835,14 +2978,17 @@ def collect_unmet_soft_warnings(
     course_instances: list[dict],
     wanted_prefs_by_instance: dict[str, dict],
     solver_config: dict,
+    rooms_by_id: dict[str, dict] | None = None,
 ) -> list[dict]:
     """Warnings, если решение есть, но soft-пожелания не выполнены."""
     warnings: list[dict] = []
     inst_by_id = {inst["instance_id"]: inst for inst in course_instances}
+    rooms_by_id = rooms_by_id or {}
     late_from = int(solver_config.get("late_slot_from", 5))
     weight_saturday = int(solver_config.get("weight_saturday", 0))
     weight_late = int(solver_config.get("weight_late_slot", 0))
     weight_wanted = int(solver_config.get("weight_wanted_slot", 0))
+    weight_screen = int(solver_config.get("weight_preferred_screen", 0) or 0)
 
     for row in schedule:
         inst = inst_by_id.get(row["instance_id"]) or {}
@@ -2905,6 +3051,33 @@ def collect_unmet_soft_warnings(
                 "entity_ids": [row["instance_id"]],
                 "slot_index": slot_index,
             })
+
+        requirements = list(inst.get("requirements") or [])
+        room_id = row.get("room_id")
+        room = rooms_by_id.get(str(room_id)) if room_id is not None else None
+        if room is not None and not room.get("is_virtual"):
+            unmet_soft = [
+                req for req in requirements
+                if req in SOFT_EQUIPMENT_REQUIREMENTS
+                and not room_satisfies_soft_equipment(room, req)
+            ]
+            # internet без флагов почти всегда « unmet » — не спамим, если вес screen=0
+            # и internet нечем проверить; screen сообщаем при weight_preferred_screen>0
+            report = []
+            if weight_screen and "screen" in unmet_soft:
+                report.append("screen")
+            if report:
+                warnings.append({
+                    "code": "UNMET_SOFT_EQUIPMENT",
+                    "message": (
+                        f"Курс '{row.get('course_name')}' в аудитории {room_id} "
+                        f"без желаемого оснащения: {', '.join(report)}"
+                    ),
+                    "course_id": row.get("course_id"),
+                    "entity_ids": [row["instance_id"]],
+                    "room_id": room_id,
+                    "missing_soft_requirements": report,
+                })
     return warnings
 
 
@@ -3069,6 +3242,7 @@ def solve_two_phase(
     late_slot_from = int(solver_config.get("late_slot_from", 5))
     weight_preferred_capacity = int(solver_config["weight_preferred_capacity"])
     weight_preferred_room_type = int(solver_config["weight_preferred_room_type"])
+    weight_preferred_screen = int(solver_config.get("weight_preferred_screen", 0) or 0)
     workers = int(solver_config["num_search_workers"])
     allow_partial = str(solver_config.get("unplaceable_instance_policy") or "strict").casefold() == "warn"
     phase1_no_domain: list[dict] = []
@@ -3484,6 +3658,11 @@ def solve_two_phase(
                     score -= weight_preferred_capacity
                 if preferred_types and not room_matches_preferred_type(room, preferred_types):
                     score -= weight_preferred_room_type
+                score -= soft_equipment_penalty(
+                    room,
+                    inst.get("requirements"),
+                    weight_screen=weight_preferred_screen,
+                )
             if score:
                 obj2.append(score * var)
         if allow_partial:
@@ -3686,6 +3865,7 @@ def solve_two_phase(
         course_instances=course_instances,
         wanted_prefs_by_instance=wanted_prefs_by_instance,
         solver_config=solver_config,
+        rooms_by_id=rooms_by_id,
     )
     dropped_ids = {
         inst["instance_id"] for inst in phase1_dropped + phase2_no_domain
@@ -3722,14 +3902,17 @@ def solve_two_phase(
             "best_objective_bound": solver1.BestObjectiveBound(),
         })
     status_label = "SUCCESS_WITH_WARNINGS" if all_warnings else "SUCCESS"
+    warning_groups = partition_warnings(all_warnings)
     result_payload = {
         "status": status_label,
         "errors": [],
         "warnings": all_warnings,
-        "unplaced": [
-            warning for warning in all_warnings
-            if warning.get("code") == "UNPLACEABLE_INSTANCE_DROPPED"
-        ],
+        "warning_groups": {
+            "unplaced": warning_groups["unplaced"],
+            "soft": warning_groups["soft"],
+            "other": warning_groups["other"],
+        },
+        "unplaced": warning_groups["unplaced"],
         "schedule": schedule_result,
         "meta": {
             "solve_strategy": "two_phase",
@@ -3753,6 +3936,9 @@ def solve_two_phase(
             "max_candidate_rooms": int(solver_config.get("max_candidate_rooms") or 0),
             "missing_teacher_policy": resolve_missing_teacher_policy(solver_config),
             "unmet_soft_count": len(soft_warnings),
+            "unplaced_warning_count": len(warning_groups["unplaced"]),
+            "soft_warning_count": len(warning_groups["soft"]),
+            "room_repair_rounds": int(solver_config.get("room_repair_rounds") or 0),
         },
     }
 
@@ -3768,12 +3954,15 @@ def solve_two_phase(
         and inst["instance_id"] not in assigned_room
     }
     elapsed_total = time_module.perf_counter() - profile_started
-    repair_time = min(60.0, (total_limit - elapsed_total) / max(1, repair_rounds_left))
+    remaining = max(0.0, float(total_limit) - elapsed_total)
+    # Больше бюджета на repair: до 3 мин на раунд, но не больше остатка / число раундов.
+    repair_time = min(180.0, remaining / max(1, repair_rounds_left))
     if (
         allow_partial
         and room_dropped_ids
         and repair_rounds_left > 0
-        and repair_time >= 20.0
+        and remaining >= 15.0
+        and repair_time >= 10.0
     ):
         new_blocked = {
             str(instance_id): set(int(value) for value in values)
@@ -4048,6 +4237,7 @@ def solve_schedule(input_json_str: str, config: dict | None = None) -> str:
     weight_wanted_slot = int(solver_config["weight_wanted_slot"])
     weight_preferred_capacity = int(solver_config["weight_preferred_capacity"])
     weight_preferred_room_type = int(solver_config["weight_preferred_room_type"])
+    weight_preferred_screen = int(solver_config.get("weight_preferred_screen", 0) or 0)
     weight_time_wish = int(solver_config.get("weight_time_wish", 8))
     weight_group_gap = int(solver_config.get("weight_group_gap", 5))
     weight_late_slot = int(solver_config.get("weight_late_slot", 2))
@@ -4375,6 +4565,11 @@ def solve_schedule(input_json_str: str, config: dict | None = None) -> str:
                         score -= weight_preferred_capacity
                     if preferred_types and not room_matches_preferred_type(r, preferred_types):
                         score -= weight_preferred_room_type
+                    score -= soft_equipment_penalty(
+                        r,
+                        inst.get("requirements"),
+                        weight_screen=weight_preferred_screen,
+                    )
                 if score:
                     objective_terms.append(score * var)
 
@@ -4694,17 +4889,21 @@ def solve_schedule(input_json_str: str, config: dict | None = None) -> str:
             course_instances=course_instances,
             wanted_prefs_by_instance=wanted_prefs_by_instance,
             solver_config=solver_config,
+            rooms_by_id=rooms_by_id,
         )
         all_warnings = list(solver_warnings) + soft_warnings
         status_label = "SUCCESS_WITH_WARNINGS" if all_warnings else "SUCCESS"
+        warning_groups = partition_warnings(all_warnings)
         return json.dumps({
             "status": status_label,
             "errors": [],
             "warnings": all_warnings,
-            "unplaced": [
-                warning for warning in all_warnings
-                if warning.get("code") == "UNPLACEABLE_INSTANCE_DROPPED"
-            ],
+            "warning_groups": {
+                "unplaced": warning_groups["unplaced"],
+                "soft": warning_groups["soft"],
+                "other": warning_groups["other"],
+            },
+            "unplaced": warning_groups["unplaced"],
             "schedule": schedule_result,
             "meta": {
                 "solve_time_sec": round(solver.WallTime(), 3),
@@ -4718,6 +4917,7 @@ def solve_schedule(input_json_str: str, config: dict | None = None) -> str:
                     "wanted_slot": weight_wanted_slot,
                     "preferred_capacity": weight_preferred_capacity,
                     "preferred_room_type": weight_preferred_room_type,
+                    "preferred_screen": weight_preferred_screen,
                     "time_wish": weight_time_wish,
                     "group_gap": weight_group_gap,
                     "late_slot": weight_late_slot,
@@ -4730,6 +4930,8 @@ def solve_schedule(input_json_str: str, config: dict | None = None) -> str:
                 "max_candidate_rooms": int(solver_config.get("max_candidate_rooms") or 0),
                 "instances_count": len(course_instances),
                 "unmet_soft_count": len(soft_warnings),
+                "unplaced_warning_count": len(warning_groups["unplaced"]),
+                "soft_warning_count": len(warning_groups["soft"]),
             },
         }, ensure_ascii=False, indent=2)
 

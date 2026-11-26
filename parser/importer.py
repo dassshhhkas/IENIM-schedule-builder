@@ -1831,15 +1831,20 @@ class Importer:
         instances, subgroup_count = self._build_course_instances(
             course_id, name, lesson_type, specs, teacher_meta, column_count,
             group_ids, requirements, sheet_name)
+        needs_physical_room = venue_type not in {"sport", "online", "external", "virtual"}
         for instance in instances:
             instance["requirements"] = list(requirements)
             instance["needs_software"] = bool(software_raw)
             instance["software_raw"] = software_raw
             instance["location_raw"] = location["location_raw"]
-            instance["allowed_room_ids"] = list(location["allowed_room_ids"])
+            # Sport/PE (и прочие вне ИЕНИМ) не должны попадать в room-домен.
+            instance["allowed_room_ids"] = (
+                [] if not needs_physical_room else list(location["allowed_room_ids"])
+            )
             instance["same_room_as_course_id"] = None
             instance["same_room_as_instance_ids"] = []
             instance["venue_type"] = venue_type
+            instance["needs_physical_room"] = needs_physical_room
             instance["time_wish_raw"] = time_wish_raw
             instance["time_wish_rules"] = []
             instance["time_wish_unmanaged"] = []
@@ -1861,8 +1866,11 @@ class Importer:
                 "needs_software": bool(software_raw),
                 "software_raw": software_raw,
                 "location_raw": location["location_raw"],
-                "allowed_room_ids": location["allowed_room_ids"],
+                "allowed_room_ids": (
+                    [] if not needs_physical_room else location["allowed_room_ids"]
+                ),
                 "venue_type": venue_type,
+                "needs_physical_room": needs_physical_room,
                 "time_wish_raw": time_wish_raw,
                 "time_wish_rules": [],
                 "time_wish_unmanaged": [],
@@ -1899,6 +1907,15 @@ class Importer:
             (lesson_type != "лекция" and column_count > 1)
         if not split_requested:
             teacher_ids = self._unique_names([spec["name"] for spec in specs])
+            # Практики/лабы с несколькими учебными группами и без явной нарезки
+            # подгрупп раньше схлопывались в один instance на 100–400+ человек
+            # (ИЯ/ОРГ на «Тургенева 4»). Режем по одной академической группе.
+            if lesson_type != "лекция" and len(group_ids) > 1:
+                return self._split_instances_by_group(
+                    course_id, name, lesson_type, teacher_ids, group_ids,
+                    requirements, teacher_meta, sheet_name,
+                    reason="нет числа подгрупп в Excel при нескольких group_ids",
+                )
             if lesson_type == "лекция":
                 lesson_kind = "lecture_stream"
             elif len(teacher_ids) > 1:
@@ -1975,6 +1992,39 @@ class Importer:
                 team_label=team_label,
                 team_count=single["team_count"] if single else None,
                 team_index=single.get("team_index") if single else None))
+        return instances, subgroup_count
+
+    def _split_instances_by_group(
+        self,
+        course_id: str,
+        name: str,
+        lesson_type: str,
+        teacher_ids: list[str],
+        group_ids: list[str],
+        requirements: list[str],
+        teacher_meta: dict | None,
+        sheet_name: str | None,
+        *,
+        reason: str,
+    ) -> tuple[list[dict], int]:
+        """Один instance на академическую группу (практика/лаба без явных подгрупп)."""
+        subgroup_count = len(group_ids)
+        if lesson_type == "лабораторная":
+            lesson_kind = "lab_subgroup"
+        else:
+            lesson_kind = "practice_subgroup"
+        team_label = (teacher_meta or {}).get("cell_label")
+        where = f"Лист {sheet_name!r}, " if sheet_name else ""
+        self._warnings.append(
+            f"{where}{course_id}: автонарезка на {subgroup_count} instances "
+            f"по group_ids ({reason})"
+        )
+        teachers = list(teacher_ids or [])
+        instances = []
+        for index, group_id in enumerate(group_ids, start=1):
+            instances.append(self._make_instance(
+                course_id, name, lesson_type, lesson_kind, teachers, [group_id],
+                requirements, index, subgroup_count, team_label=team_label))
         return instances, subgroup_count
 
     @staticmethod
@@ -2366,17 +2416,76 @@ class Importer:
             total = sum(self._groups[group_id]["size"]
                         for group_id in course["group_ids"] if group_id in self._groups)
             course["students_needed"] = total
-            subgroup_count = max(1, int(course.get("subgroup_count") or 1))
             instances = course.get("instances") or []
+            # Страховка: практика/лаба с одним instance на много групп → нарезка.
+            if (
+                course.get("lesson_type") != "лекция"
+                and len(course.get("group_ids") or []) > 1
+                and len(instances) <= 1
+            ):
+                template = instances[0] if instances else {}
+                split_instances, _ = self._split_instances_by_group(
+                    course["id"],
+                    self._course_label(course),
+                    course.get("lesson_type") or "практика",
+                    list(template.get("teacher_ids") or course.get("teacher_ids") or []),
+                    list(course.get("group_ids") or []),
+                    list(template.get("requirements") or course.get("requirements") or []),
+                    {"cell_label": template.get("team_label")},
+                    course.get("source_sheet"),
+                    reason="финализация: один instance на несколько group_ids",
+                )
+                for instance in split_instances:
+                    for key in (
+                        "requirements", "needs_software", "software_raw",
+                        "location_raw", "allowed_room_ids", "same_room_as_course_id",
+                        "same_room_as_instance_ids", "venue_type", "needs_physical_room",
+                        "time_wish_raw", "time_wish_rules", "time_wish_unmanaged",
+                        "comments_raw", "comments_hints", "lessons_per_week",
+                        "week_pattern", "duration_slots",
+                    ):
+                        if key in template:
+                            instance[key] = (
+                                list(template[key])
+                                if isinstance(template.get(key), list)
+                                else template.get(key)
+                            )
+                    if course.get("venue_type") in {"sport", "online", "external", "virtual"}:
+                        instance["venue_type"] = course.get("venue_type")
+                        instance["needs_physical_room"] = False
+                        instance["allowed_room_ids"] = []
+                course["instances"] = split_instances
+                instances = split_instances
+
+            subgroup_count = max(1, len(instances), int(course.get("subgroup_count") or 1))
+            course["subgroup_count"] = len(instances) or subgroup_count
+            subgroup_count = course["subgroup_count"]
             if len(instances) != subgroup_count:
                 self._warnings.append(
                     f"Курс {course['id']}: создано {len(instances)} instances, "
                     f"ожидалось {subgroup_count}")
-            per_instance = max(1, math.ceil(total / subgroup_count))
+            course_group_set = set(course.get("group_ids") or [])
+            per_instance = max(1, math.ceil(total / max(1, subgroup_count)))
             for index, instance in enumerate(instances, start=1):
-                instance["students_needed"] = per_instance
+                inst_groups = list(instance.get("group_ids") or course.get("group_ids") or [])
+                inst_set = set(inst_groups)
+                if inst_set and inst_set != course_group_set:
+                    needed = sum(
+                        self._groups[group_id]["size"]
+                        for group_id in inst_groups if group_id in self._groups
+                    )
+                    instance["students_needed"] = max(1, needed)
+                else:
+                    instance["students_needed"] = per_instance
                 instance["subgroup_index"] = index
                 instance["subgroup_count"] = subgroup_count
+                if course.get("venue_type") in {"sport", "online", "external", "virtual"}:
+                    instance["venue_type"] = course.get("venue_type")
+                    instance["needs_physical_room"] = False
+                    instance["allowed_room_ids"] = []
+            if course.get("venue_type") in {"sport", "online", "external", "virtual"}:
+                course["needs_physical_room"] = False
+                course["allowed_room_ids"] = []
             self._validate_course_instances(course)
 
     def _validate_course_instances(self, course: dict) -> None:
@@ -2849,8 +2958,50 @@ class Importer:
                 )
                 continue
             pe_course["group_ids"] = groups_for_year
-            for instance in pe_course.get("instances") or []:
-                instance["group_ids"] = list(groups_for_year)
+            instances = pe_course.get("instances") or []
+            # После раскрытия «все» не оставляем один sport-instance на весь курс
+            # (иначе students_needed=400+ и риск утащить физру в room-домен).
+            if (
+                pe_course.get("lesson_type") != "лекция"
+                and len(groups_for_year) > 1
+                and len(instances) <= 1
+            ):
+                template = instances[0] if instances else {}
+                split_instances, subgroup_count = self._split_instances_by_group(
+                    pe_course["id"],
+                    self._course_label(pe_course),
+                    pe_course.get("lesson_type") or "практика",
+                    list(template.get("teacher_ids") or pe_course.get("teacher_ids") or []),
+                    groups_for_year,
+                    list(template.get("requirements") or pe_course.get("requirements") or []),
+                    {"cell_label": template.get("team_label")},
+                    pe_course.get("source_sheet"),
+                    reason="раскрытие маркера «все» у физкультуры",
+                )
+                for instance in split_instances:
+                    for key in (
+                        "requirements", "needs_software", "software_raw",
+                        "location_raw", "allowed_room_ids", "same_room_as_course_id",
+                        "same_room_as_instance_ids", "venue_type", "needs_physical_room",
+                        "time_wish_raw", "time_wish_rules", "time_wish_unmanaged",
+                        "comments_raw", "comments_hints", "lessons_per_week",
+                        "week_pattern", "duration_slots",
+                    ):
+                        if key in template:
+                            instance[key] = (
+                                list(template[key])
+                                if isinstance(template.get(key), list)
+                                else template.get(key)
+                            )
+                    instance["venue_type"] = "sport"
+                    instance["needs_physical_room"] = False
+                    instance["allowed_room_ids"] = []
+                    instance["requirements"] = []
+                pe_course["instances"] = split_instances
+                pe_course["subgroup_count"] = subgroup_count
+            else:
+                for instance in instances:
+                    instance["group_ids"] = list(groups_for_year)
             for sentinel in sentinels:
                 self._groups.pop(sentinel, None)
                 self._group_sizes.pop(sentinel, None)

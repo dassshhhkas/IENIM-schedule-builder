@@ -87,8 +87,8 @@
 
 | Правило | Статус | Простыми словами |
 |---------|--------|------------------|
-| Вместимость | готово | В аудиторию должно помещаться нужное число студентов |
-| Оснащение | готово | Есть нужная доска / ПО / прочие hard-требования |
+| Вместимость | готово | `students_needed ≤ capacity × 1.2` (запас +20%; конфиг `capacity_overbook_factor`) |
+| Оснащение | готово | Hard: доска / `computer_class`+ПО. `internet` и `screen` **не hard-kill** (soft: штраф `weight_preferred_screen`, proxy по типу `м`/мультимедиа; warning `UNMET_SOFT_EQUIPMENT`) |
 | Запреты преподавателя | готово | Слот из «не могу» не предлагается (для длинной пары — ни один слот блока) |
 | Fixed-слоты | готово | Вне закреплённых слотов вариантов нет |
 | Fixed-аудитория из анкеты | готово | Если однозначно указана аудитория — только она |
@@ -114,7 +114,8 @@
 
 Pre-check (`precheck_placement_domains`) гоняет каждый instance до запуска солвера.  
 `diagnose_no_solution` добавляет подсказки (fixed, запреты, загруженные teachers/groups, timeout).  
-`collect_unmet_soft_warnings` поднимает невыполненные soft в `warnings[]` без смены допустимости.
+`collect_unmet_soft_warnings` поднимает невыполненные soft в `warnings[]` без смены допустимости.  
+Отчёт/UI делит warnings на **непостановку** (`UNPLACEABLE_INSTANCE_DROPPED` → лист «Непоставленные») и **мягкие замечания** (лист «Мягкие замечания»); в JSON — `warning_groups`.
 
 ---
 
@@ -127,6 +128,7 @@ Pre-check (`precheck_placement_domains`) гоняет каждый instance до
 | Желаемые слоты преподавателя | готово | Бонус, если старт пары попал в указанные в анкете слоты |
 | Предпочтительная вместимость | готово | Штраф, если аудитория меньше желаемой из анкеты |
 | Предпочтительный тип аудитории | готово | Штраф за несовпадение вида (лекционная / компьютерный и т.п.) |
+| Экран (`screen`) | готово | Не hard: штраф `weight_preferred_screen`; proxy `has_screen` / multimedia / тип `м`; иначе `UNMET_SOFT_EQUIPMENT` |
 | Окна у группы | готово | Штраф за пустой слот между первой и последней парой группы в дне |
 | Поздние пары / суббота | готово | Штраф за `slot_index >= late_slot_from` и за субботу |
 | Пожелания из листа дисциплин | готово | Soft `prefer_slots` / `strength=soft`; сырой текст → warning |
@@ -137,9 +139,10 @@ Pre-check (`precheck_placement_domains`) гоняет каждый instance до
 
 ## Настройки, которые меняют поведение
 
-- **Время поиска** — `max_time_in_seconds` (по умолчанию 10 с; полный прогон 300–900), `num_search_workers`.
-- **Масштаб** — `solve_strategy` (`auto`/`monolithic`/`two_phase`), `max_candidate_rooms`, `var_threshold_two_phase`, `repair_on_two_phase_fail`, `scope_course_ids`.
-- **Веса soft** — `weight_wanted_slot`, `weight_preferred_capacity`, `weight_preferred_room_type`, `weight_time_wish`, `weight_group_gap`, `weight_late_slot`, `weight_saturday`.
+- **Время поиска** — `max_time_in_seconds` (по умолчанию 10 с; полный прогон UI 900), `num_search_workers`.
+- **Масштаб** — `solve_strategy` (`auto`/`monolithic`/`two_phase`), `max_candidate_rooms`, `var_threshold_two_phase`, `repair_on_two_phase_fail`, `room_repair_rounds` (по умолчанию 4), `two_phase_time_fraction` (0.50), `scope_course_ids`.
+- **Запас вместимости** — `capacity_overbook_factor` (по умолчанию `1.2`, т.е. +20%).
+- **Веса soft** — `weight_wanted_slot`, `weight_preferred_capacity`, `weight_preferred_room_type`, `weight_preferred_screen`, `weight_time_wish`, `weight_group_gap`, `weight_late_slot`, `weight_saturday`.
 - **Поздние пары** — `late_slot_from` (по умолчанию 5).
 - **Оценка числа студентов**, если парсер не дал точное — `default_group_size`, для лекций потока ещё `lecture_stream_size_factor`.
 - **Календарь недель** — `semester_weeks` / `semester_week_start` (по умолчанию недели 1…16).

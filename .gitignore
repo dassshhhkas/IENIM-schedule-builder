@@ -182,3 +182,6 @@ fabric.properties
 .idea
 
 */*data.json
+
+# Прогоны UI (загрузки пользователей и результаты)
+runs/
