@@ -25,6 +25,7 @@ python -m venv .venv
 - `--scope c1,c2` — ограничить запуск указанными ID курсов.
 - `--max-time SECONDS` — лимит времени поиска.
 - `--strategy auto|monolithic|two_phase` — стратегия решателя.
+- `--capacity-overflow-percent PERCENT` — допустимое превышение вместимости аудитории в процентах; по умолчанию `0` (жёсткое условие `students <= capacity`). Например, `10` разрешает `students <= floor(capacity * 1.1)`.
 
 ## Формат и ограничения
 

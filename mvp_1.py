@@ -35,6 +35,8 @@ DEFAULT_CONFIG = {
     "weight_preferred_room_type": 1,
     # вместимость, если парсер не дал students_needed
     "default_group_size": 30,
+    # допустимое превышение вместимости аудитории, % (0 = students <= capacity)
+    "capacity_overflow_percent": 0.0,
     # для lecture_stream при «дефолтных» size у всех групп потока
     "lecture_stream_size_factor": 0.8,
     # календарь семестра: недели start .. start+n-1
@@ -190,6 +192,18 @@ def resolve_solver_config(data: dict, config: dict | None = None) -> dict:
     return merged
 
 
+def resolve_capacity_overflow_percent(config: dict) -> float:
+    """Нормализовать процент допустимого превышения вместимости (>= 0)."""
+    raw = config.get("capacity_overflow_percent", 0.0)
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return 0.0
+    if math.isnan(value) or math.isinf(value) or value < 0:
+        return 0.0
+    return value
+
+
 def prepare_parser_data(data: dict) -> dict:
     """
     Legacy-адаптер перед solve_schedule.
@@ -292,15 +306,26 @@ def room_capacity_value(room: dict) -> int | None:
         return None
 
 
+def capacity_overflow_allowed(capacity: int, overflow_percent: float) -> int:
+    """Максимум студентов в аудитории с учётом допустимого превышения, %."""
+    if overflow_percent <= 0:
+        return capacity
+    return int(math.floor(capacity * (1.0 + overflow_percent / 100.0)))
+
+
 def room_is_feasible(
     room: dict,
     *,
     total_students: int,
     requirements: list[str] | None = None,
     needs_software: object = None,
+    capacity_overflow_percent: float = 0.0,
 ) -> bool:
     capacity = room_capacity_value(room)
-    if capacity is None or capacity < total_students:
+    if capacity is None:
+        return False
+    allowed_capacity = capacity_overflow_allowed(capacity, capacity_overflow_percent)
+    if allowed_capacity < total_students:
         return False
     if not room_meets_requirements(room, requirements):
         return False
@@ -2124,6 +2149,7 @@ def select_candidate_rooms(
     requirements: list[str] | None,
     needs_software: object,
     max_candidate_rooms: int,
+    capacity_overflow_percent: float = 0.0,
 ) -> list[dict]:
     """
     Сужение домена аудиторий (п.15): только feasible, затем до N ближайших
@@ -2137,6 +2163,7 @@ def select_candidate_rooms(
             total_students=total_students,
             requirements=requirements,
             needs_software=needs_software,
+            capacity_overflow_percent=capacity_overflow_percent,
         )
     ]
     if max_candidate_rooms <= 0 or len(feasible) <= max_candidate_rooms:
@@ -2144,8 +2171,9 @@ def select_candidate_rooms(
 
     def sort_key(room: dict) -> tuple:
         capacity = int(room.get("capacity") or 0)
+        allowed_capacity = capacity_overflow_allowed(capacity, capacity_overflow_percent)
         overflow = max(0, capacity - total_students)
-        under = max(0, total_students - capacity)  # уже отфильтровано, =0
+        under = max(0, total_students - allowed_capacity)
         return (under, overflow, capacity, str(room.get("id")))
 
     feasible.sort(key=sort_key)
@@ -2357,6 +2385,7 @@ def soften_infeasible_fixed_rooms(
     *,
     rooms_by_id: dict[str, dict],
     policy: str,
+    capacity_overflow_percent: float = 0.0,
 ) -> list[dict]:
     """
     infeasible_fixed_room_policy=warn: снять невыполнимый fixed_room,
@@ -2379,6 +2408,7 @@ def soften_infeasible_fixed_rooms(
                 total_students=inst["total_students"],
                 requirements=inst.get("requirements"),
                 needs_software=inst.get("needs_software"),
+                capacity_overflow_percent=capacity_overflow_percent,
             )
         )
         if ok:
@@ -2548,7 +2578,12 @@ def build_allowed_rooms_error(
     }
 
 
-def build_no_room_error(inst: dict, rooms: list[dict]) -> dict:
+def build_no_room_error(
+    inst: dict,
+    rooms: list[dict],
+    *,
+    capacity_overflow_percent: float = 0.0,
+) -> dict:
     """ERROR с course_id, требованиями и подсказкой по почти подходящим аудиториям."""
     requirements = list(inst.get("requirements") or [])
     needs_software = inst.get("needs_software")
@@ -2556,7 +2591,10 @@ def build_no_room_error(inst: dict, rooms: list[dict]) -> dict:
     almost = []
     for room in rooms:
         capacity = room_capacity_value(room)
-        if capacity is None or capacity < inst["total_students"]:
+        if capacity is None:
+            continue
+        allowed_capacity = capacity_overflow_allowed(capacity, capacity_overflow_percent)
+        if allowed_capacity < inst["total_students"]:
             continue
         capacity_ok.append(room["id"])
         missing = _missing_requirements_for_room(room, requirements)
@@ -2570,10 +2608,11 @@ def build_no_room_error(inst: dict, rooms: list[dict]) -> dict:
             })
 
     hint_parts = []
+    capacity_hint = f"нет аудиторий вместимостью >= {inst['total_students']}"
+    if capacity_overflow_percent > 0:
+        capacity_hint += f" (с допуском {capacity_overflow_percent:g}%)"
     if not capacity_ok:
-        hint_parts.append(
-            f"нет аудиторий вместимостью >= {inst['total_students']}"
-        )
+        hint_parts.append(capacity_hint)
     elif almost:
         preview = ", ".join(
             f"{item['room_id']} (не хватает: {', '.join(item['missing_requirements']) or 'ПО'})"
@@ -2914,6 +2953,7 @@ def build_forbidden_slots_error(
     forbidden_slot_ids: set[int],
     rooms: list[dict],
     time_slots: list[dict],
+    capacity_overflow_percent: float = 0.0,
 ) -> dict:
     """ERROR: после запретов преподавателя не осталось допустимых слотов/аудиторий."""
     feasible_rooms = [
@@ -2924,6 +2964,7 @@ def build_forbidden_slots_error(
             total_students=inst["total_students"],
             requirements=inst.get("requirements"),
             needs_software=inst.get("needs_software"),
+            capacity_overflow_percent=capacity_overflow_percent,
         )
     ]
     blocked = sorted(forbidden_slot_ids)
@@ -2968,6 +3009,9 @@ def _collect_instance_room_domain(
     if fixed_room is not None:
         fixed_room = normalize_room_id(fixed_room)
     allowed_ids = inst.get("allowed_room_ids")
+    capacity_overflow_percent = float(
+        solver_config.get("capacity_overflow_percent") or 0.0
+    )
 
     if not inst.get("needs_physical_room", True):
         virtual = make_virtual_room(
@@ -3004,6 +3048,7 @@ def _collect_instance_room_domain(
             total_students=inst["total_students"],
             requirements=inst["requirements"],
             needs_software=inst.get("needs_software"),
+            capacity_overflow_percent=capacity_overflow_percent,
         ):
             return None, build_fixed_room_error(inst, pref, rooms_by_id)
         return [room], None
@@ -3027,9 +3072,14 @@ def _collect_instance_room_domain(
         requirements=inst["requirements"],
         needs_software=inst.get("needs_software"),
         max_candidate_rooms=int(solver_config.get("max_candidate_rooms") or 0),
+        capacity_overflow_percent=capacity_overflow_percent,
     )
     if not allowed_rooms:
-        return None, build_no_room_error(inst, rooms)
+        return None, build_no_room_error(
+            inst,
+            rooms,
+            capacity_overflow_percent=capacity_overflow_percent,
+        )
     return allowed_rooms, None
 
 
@@ -3433,6 +3483,9 @@ def solve_two_phase(
                 total_students=inst["total_students"],
                 requirements=inst["requirements"],
                 needs_software=inst.get("needs_software"),
+                capacity_overflow_percent=float(
+                    solver_config.get("capacity_overflow_percent") or 0.0
+                ),
             ):
                 continue
             candidates.append(room)
@@ -3751,6 +3804,9 @@ def solve_two_phase(
             "phase1_solver_status": solver1.StatusName(status1),
             "phase1_best_objective_bound": solver1.BestObjectiveBound(),
             "max_candidate_rooms": int(solver_config.get("max_candidate_rooms") or 0),
+            "capacity_overflow_percent": float(
+                solver_config.get("capacity_overflow_percent") or 0.0
+            ),
             "missing_teacher_policy": resolve_missing_teacher_policy(solver_config),
             "unmet_soft_count": len(soft_warnings),
         },
@@ -3826,6 +3882,9 @@ def solve_schedule(input_json_str: str, config: dict | None = None) -> str:
     # 1. Загрузка данных из входного JSON
     data = json.loads(input_json_str)
     solver_config = resolve_solver_config(data, config)
+    solver_config["capacity_overflow_percent"] = resolve_capacity_overflow_percent(
+        solver_config
+    )
     
     rooms = list(data["rooms"])
     teachers = data["teachers"]
@@ -3992,6 +4051,9 @@ def solve_schedule(input_json_str: str, config: dict | None = None) -> str:
             wanted_prefs_by_instance,
             rooms_by_id=rooms_by_id,
             policy=str(solver_config.get("infeasible_fixed_room_policy") or "strict"),
+            capacity_overflow_percent=float(
+                solver_config.get("capacity_overflow_percent") or 0.0
+            ),
         )
     )
 
@@ -4233,6 +4295,9 @@ def solve_schedule(input_json_str: str, config: dict | None = None) -> str:
     # 3. Переменные: x[(inst, start_slot_id, room)] = блок duration начиная со start
     x = {}
     objective_terms: list = []
+    capacity_overflow_percent = float(
+        solver_config.get("capacity_overflow_percent") or 0.0
+    )
     for inst in course_instances:
         pref = wanted_prefs_by_instance[inst["instance_id"]]
         blocked_slots = set(forbidden_slots_by_instance.get(inst["instance_id"], set()))
@@ -4287,6 +4352,7 @@ def solve_schedule(input_json_str: str, config: dict | None = None) -> str:
                 total_students=inst["total_students"],
                 requirements=inst["requirements"],
                 needs_software=inst.get("needs_software"),
+                capacity_overflow_percent=capacity_overflow_percent,
             ):
                 return json.dumps(
                     build_fixed_room_error(inst, pref, rooms_by_id),
@@ -4320,10 +4386,15 @@ def solve_schedule(input_json_str: str, config: dict | None = None) -> str:
                 requirements=inst["requirements"],
                 needs_software=inst.get("needs_software"),
                 max_candidate_rooms=int(solver_config.get("max_candidate_rooms") or 0),
+                capacity_overflow_percent=capacity_overflow_percent,
             )
             if not allowed_rooms:
                 return json.dumps(
-                    build_no_room_error(inst, rooms),
+                    build_no_room_error(
+                        inst,
+                        rooms,
+                        capacity_overflow_percent=capacity_overflow_percent,
+                    ),
                     ensure_ascii=False,
                     indent=2,
                 )
@@ -4354,6 +4425,7 @@ def solve_schedule(input_json_str: str, config: dict | None = None) -> str:
                     total_students=inst["total_students"],
                     requirements=inst["requirements"],
                     needs_software=inst.get("needs_software"),
+                    capacity_overflow_percent=capacity_overflow_percent,
                 ):
                     continue
                 var_name = f"x_{inst['instance_id']}_s{start_id}_r{r['id']}"
@@ -4475,6 +4547,7 @@ def solve_schedule(input_json_str: str, config: dict | None = None) -> str:
                         total_students=inst["total_students"],
                         requirements=inst.get("requirements"),
                         needs_software=inst.get("needs_software"),
+                        capacity_overflow_percent=capacity_overflow_percent,
                     )
                     for room in rooms
                     if not room.get("is_virtual")
@@ -4485,9 +4558,14 @@ def solve_schedule(input_json_str: str, config: dict | None = None) -> str:
                         forbidden_slot_ids=blocked,
                         rooms=rooms,
                         time_slots=time_slots,
+                        capacity_overflow_percent=capacity_overflow_percent,
                     )
                 else:
-                    error = build_no_room_error(inst, rooms)
+                    error = build_no_room_error(
+                        inst,
+                        rooms,
+                        capacity_overflow_percent=capacity_overflow_percent,
+                    )
             return json.dumps(error, ensure_ascii=False, indent=2)
             
         model.AddExactlyOne(possible_vars)
@@ -4728,6 +4806,9 @@ def solve_schedule(input_json_str: str, config: dict | None = None) -> str:
                 "estimated_vars_monolithic": estimated_vars,
                 "variables_created": len(x),
                 "max_candidate_rooms": int(solver_config.get("max_candidate_rooms") or 0),
+                "capacity_overflow_percent": float(
+                    solver_config.get("capacity_overflow_percent") or 0.0
+                ),
                 "instances_count": len(course_instances),
                 "unmet_soft_count": len(soft_warnings),
             },
@@ -4767,6 +4848,9 @@ def solve_schedule(input_json_str: str, config: dict | None = None) -> str:
                 "estimated_vars_monolithic": estimated_vars,
                 "variables_created": len(x),
                 "timed_out": timed_out,
+                "capacity_overflow_percent": float(
+                    solver_config.get("capacity_overflow_percent") or 0.0
+                ),
             },
         ),
         ensure_ascii=False,
@@ -4787,6 +4871,15 @@ def main(argv: list[str] | None = None) -> int:
                         help="Лимит времени решателя в секундах")
     parser.add_argument("--strategy", choices=["auto", "monolithic", "two_phase"],
                         default=None, help="Стратегия построения модели")
+    parser.add_argument(
+        "--capacity-overflow-percent",
+        type=float,
+        default=None,
+        help=(
+            "Допустимое превышение вместимости аудитории, %% "
+            "(по умолчанию 0: students <= capacity)"
+        ),
+    )
     parser.add_argument("--scope", default=None,
                         help="Список course_id через запятую для демонстрационного среза")
     args = parser.parse_args(argv)
@@ -4797,6 +4890,8 @@ def main(argv: list[str] | None = None) -> int:
         config["max_time_in_seconds"] = args.max_time
     if args.strategy:
         config["solve_strategy"] = args.strategy
+    if args.capacity_overflow_percent is not None:
+        config["capacity_overflow_percent"] = args.capacity_overflow_percent
     if args.scope:
         config["scope_course_ids"] = [
             course_id.strip() for course_id in args.scope.split(",") if course_id.strip()
